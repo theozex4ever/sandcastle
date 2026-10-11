@@ -16,6 +16,7 @@ import type { Timeouts } from "./run.js";
 import * as WorktreeManager from "./WorktreeManager.js";
 import { copyToWorktree } from "./CopyToWorktree.js";
 import { Display } from "./Display.js";
+import { currentRunEvents, emitRunEvent } from "./RunEvents.js";
 import type {
   SandboxProvider,
   BranchStrategy,
@@ -329,8 +330,43 @@ export const WorktreeDockerSandboxFactory = {
               ? WorktreeManager.create(hostRepoDir, { branch, baseBranch })
               : WorktreeManager.create(hostRepoDir, { name }),
           ),
+          Effect.tap((info) =>
+            emitRunEvent({
+              type: "worktreeReady",
+              path: info.path,
+              branch: info.branch,
+              reused: false,
+            }),
+          ),
           Effect.provideService(FileSystem.FileSystem, fileSystem),
         );
+
+      /** Copy `copyToWorktree` paths, bracketed by run events. */
+      const copyPathsInto = (worktreePath: string) =>
+        Effect.flatMap(currentRunEvents, (events) => {
+          const started = Date.now();
+          events.emit({ type: "copyToWorktreeStarted", paths: copyPaths! });
+          return display
+            .spinner(
+              "Copying to worktree",
+              copyToWorktree(
+                copyPaths!,
+                hostRepoDir,
+                worktreePath,
+                timeouts?.copyToWorktreeMs,
+              ),
+            )
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() =>
+                  events.emit({
+                    type: "copyToWorktreeFinished",
+                    durationMs: Date.now() - started,
+                  }),
+                ),
+              ),
+            );
+        });
 
       return {
         withSandbox: <A, E, R>(
@@ -393,15 +429,7 @@ export const WorktreeDockerSandboxFactory = {
               pruneAndCreate(),
               (worktreeInfo) =>
                 (copyPaths && copyPaths.length > 0
-                  ? display.spinner(
-                      "Copying to worktree",
-                      copyToWorktree(
-                        copyPaths,
-                        hostRepoDir,
-                        worktreeInfo.path,
-                        timeouts?.copyToWorktreeMs,
-                      ),
-                    )
+                  ? copyPathsInto(worktreeInfo.path)
                   : Effect.succeed(undefined)
                 ).pipe(
                   Effect.andThen(
@@ -598,15 +626,7 @@ export const WorktreeDockerSandboxFactory = {
             // the sandbox under a nested acquireUseRelease.
             (worktreeInfo) =>
               (copyPaths && copyPaths.length > 0
-                ? display.spinner(
-                    "Copying to worktree",
-                    copyToWorktree(
-                      copyPaths,
-                      hostRepoDir,
-                      worktreeInfo.path,
-                      timeouts?.copyToWorktreeMs,
-                    ),
-                  )
+                ? copyPathsInto(worktreeInfo.path)
                 : Effect.succeed(undefined)
               ).pipe(
                 Effect.andThen(

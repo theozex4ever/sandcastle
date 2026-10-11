@@ -77,6 +77,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
+    // Labels group this run's events on the dashboard (see README: Run events).
+    labels: { phase: "plan", cycle: iteration },
     // Opus for planning: dependency analysis benefits from deeper reasoning.
     agent: sandcastle.claudeCode("claude-opus-4-8"),
     promptFile: "./.sandcastle/plan-prompt.md",
@@ -124,6 +126,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         // Run the implementer
         const implement = await sandbox.run({
           name: "implementer",
+          labels: { phase: "implement", cycle: iteration, issue: issue.id },
           maxIterations: 100,
           agent: sandcastle.claudeCode("claude-sonnet-4-6"),
           promptFile: "./.sandcastle/implement-prompt.md",
@@ -138,6 +141,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         if (implement.commits.length > 0) {
           const review = await sandbox.run({
             name: "reviewer",
+            labels: { phase: "review", cycle: iteration, issue: issue.id },
             maxIterations: 1,
             agent: sandcastle.claudeCode("claude-sonnet-4-6"),
             promptFile: "./.sandcastle/review-prompt.md",
@@ -209,6 +213,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     hooks,
     sandbox: docker(),
     name: "merger",
+    labels: { phase: "merge", cycle: iteration },
     maxIterations: 1,
     agent: sandcastle.claudeCode("claude-sonnet-4-6"),
     promptFile: "./.sandcastle/merge-prompt.md",

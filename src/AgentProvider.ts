@@ -263,6 +263,8 @@ export interface AgentSessionStorage {
 
 export interface AgentProvider {
   readonly name: string;
+  /** Model identifier the provider was constructed with (e.g. "claude-opus-4-8"). Surfaced on run events. */
+  readonly model?: string;
   /** Environment variables injected by this agent provider. Merged at launch time with env resolver and sandbox provider env. */
   readonly env: Record<string, string>;
   /** When true, session capture is enabled for this provider. Default: true for Claude Code, false for others. */
@@ -630,6 +632,7 @@ export const pi = (
   options?: PiOptions,
 ): AgentProvider & { readonly sessionStorage: AgentSessionStorage } => ({
   name: "pi",
+  model,
   env: options?.env ?? {},
   captureSessions: options?.captureSessions ?? true,
   sessionStorage: makePiSessionStorage(options),
@@ -775,6 +778,7 @@ export const codex = (
   options?: CodexOptions,
 ): AgentProvider & { readonly sessionStorage: AgentSessionStorage } => ({
   name: "codex",
+  model,
   env: options?.env ?? {},
   captureSessions: options?.captureSessions ?? true,
   sessionStorage: makeCodexSessionStorage(options),
@@ -839,6 +843,7 @@ export const cursor = (
   options?: CursorOptions,
 ): AgentProvider => ({
   name: "cursor",
+  model,
   env: options?.env ?? {},
   captureSessions: false,
 
@@ -961,6 +966,7 @@ export const opencode = (
   options?: OpenCodeOptions,
 ): AgentProvider => ({
   name: "opencode",
+  model,
   env: options?.env ?? {},
   captureSessions: false,
 
@@ -1111,6 +1117,7 @@ export const copilot = (
   options?: CopilotOptions,
 ): AgentProvider => ({
   name: "copilot",
+  model,
   env: options?.env ?? {},
   captureSessions: false,
 
@@ -1183,6 +1190,7 @@ export const claudeCode = (
   options?: ClaudeCodeOptions,
 ): AgentProvider & { readonly sessionStorage: AgentSessionStorage } => ({
   name: "claude-code",
+  model,
   env: options?.env ?? {},
   captureSessions: options?.captureSessions ?? true,
   sessionStorage: makeClaudeSessionStorage(options),

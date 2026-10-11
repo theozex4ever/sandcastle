@@ -9,6 +9,10 @@ await run({
   // A name for this run, shown as a prefix in log output.
   name: "worker",
 
+  // Labels tag this run's structured events (written to .sandcastle/events/)
+  // so the dashboard can group runs. Free-form key/value pairs.
+  labels: { phase: "implement" },
+
   // Sandbox provider — runs the agent inside an isolated container.
   sandbox: docker(),
 

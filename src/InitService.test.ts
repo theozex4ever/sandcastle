@@ -171,7 +171,7 @@ describe("InitService scaffold", () => {
     );
   });
 
-  it("includes .env, logs/, and worktrees/ in .gitignore but not patches/", async () => {
+  it("includes .env, logs/, worktrees/, and events/ in .gitignore but not patches/", async () => {
     const dir = await makeDir();
     await runScaffold(dir);
 
@@ -182,6 +182,7 @@ describe("InitService scaffold", () => {
     expect(gitignore).toContain(".env");
     expect(gitignore).toContain("logs/");
     expect(gitignore).toContain("worktrees/");
+    expect(gitignore).toContain("events/");
     expect(gitignore).not.toContain("patches/");
   });
 

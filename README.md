@@ -250,6 +250,14 @@ const result = await run({
   // Requires maxIterations === 1 and the tag must appear in the prompt.
   // output: Output.object({ tag: "result", schema: z.object({ answer: z.number() }) }),
   // output: Output.string({ tag: "summary" }),
+
+  // Free-form tags carried on this run's structured events, so observers
+  // (like the dashboard) can group runs. See "Run events" below.
+  labels: { phase: "implement", issue: "42" },
+
+  // Where structured run events go. Default: NDJSON at
+  // .sandcastle/events/<sessionId>.ndjson. Pass false to disable.
+  events: { onEvent: (event) => myTracer.record(event) },
 });
 
 console.log(result.iterations.length); // number of iterations executed
@@ -747,6 +755,58 @@ try {
 }
 ```
 
+### Run events
+
+Every `run()`, `sandbox.run()` and `wt.run()` emits a structured stream of **run events** — worktree and sandbox setup, hooks, iterations, agent text and tool calls, commits, and the run's outcome. By default each event is appended as one JSON line to:
+
+```
+.sandcastle/events/<sessionId>.ndjson
+```
+
+All runs made by one process share a `sessionId`, so a whole template script (planner, parallel implementers, reviewers, merger) lands in a single file. Set `SANDCASTLE_SESSION_ID` to choose the id yourself, or `SANDCASTLE_EVENTS=0` to turn the default file off.
+
+```typescript
+import { run, claudeCode, type RunEvent } from "@ai-hero/sandcastle";
+import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+
+await run({
+  agent: claudeCode("claude-sonnet-4-6"),
+  sandbox: docker(),
+  promptFile: ".sandcastle/implement-prompt.md",
+  // Tags for grouping — Sandcastle does not interpret them.
+  labels: { phase: "implement", issue: "42", cycle: 1 },
+  events: {
+    // Also receive every event in-process (errors thrown here are swallowed).
+    onEvent: (event: RunEvent) => {
+      if (event.type === "toolCall")
+        console.log(event.name, event.formattedArgs);
+    },
+    // file: false,                    // disable the NDJSON file
+    // file: "tmp/my-run.ndjson",      // or write it somewhere else
+  },
+});
+```
+
+Every event carries an envelope — `v` (schema version), `ts`, `sessionId`, `runId`, `seq` — plus a `type`:
+
+| Type                                               | When                                                                                                     |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `runStarted`                                       | Run begins. Carries `name`, `labels`, `agent`, `model`, `sandbox`, `branchStrategy`, `branch`.           |
+| `iterationStarted` / `iterationFinished`           | Each iteration. `iterationFinished` carries `sessionId`, `usage` (when the agent reports it), `commits`. |
+| `worktreeReady`                                    | Worktree created (`reused: true` when a `createWorktree`/`createSandbox` handle is reused).              |
+| `copyToWorktreeStarted` / `copyToWorktreeFinished` | `copyToWorktree` paths copied.                                                                           |
+| `sandboxStarting` / `sandboxReady`                 | Sandbox provisioned (`reused: true` for `sandbox.run()`).                                                |
+| `hookStarted` / `hookFinished`                     | Each lifecycle hook, with `hook`, `where` (`host`/`sandbox`), `command`, `durationMs`, `ok`.             |
+| `agentStarted` / `agentStopped`                    | Agent process invoked / exited.                                                                          |
+| `agentText` / `toolCall`                           | Agent output.                                                                                            |
+| `idleWarning`                                      | Agent silent for another minute; carries `idleTimeoutSeconds` for countdowns.                            |
+| `completionSignal` / `hangingProcess`              | Completion signal seen / process force-completed after the completion timeout.                           |
+| `commit`                                           | One per commit collected after an iteration.                                                             |
+| `structuredOutput`                                 | Parsed [structured output](#structured-output).                                                          |
+| `runFinished` / `runFailed`                        | Outcome. `runFailed` carries `errorTag` (e.g. `AgentIdleTimeoutError`), `message`, `aborted`.            |
+
+`runStarted` is emitted once setup validation has passed; configuration errors thrown synchronously by `run()` (missing prompt file, invalid options) do not produce events. `interactive()` sessions are not instrumented.
+
 ### Templates
 
 `sandcastle init` prompts you to choose a sandbox provider (Docker or Podman), an issue tracker (GitHub Issues, Beads, or Custom), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Choosing **Custom** scaffolds the project in a deliberately broken-until-configured state plus a `.sandcastle/SETUP_ISSUE_TRACKER.md` prompt you feed to your coding agent, which wires up your own tracker by editing the scaffolded files in place. Five templates are available:
@@ -853,6 +913,8 @@ Removes the Podman image.
 | `signal`                   | AbortSignal        | —                             | Cancel the run when aborted. Kills the in-flight agent subprocess and cancels lifecycle hooks; the worktree is preserved on disk. Rejects with `signal.reason`.                                                              |
 | `timeouts`                 | Timeouts           | —                             | Override default timeouts for built-in lifecycle steps: `copyToWorktreeMs` (60 000), `gitSetupMs` (10 000), `commitCollectionMs` (30 000), `mergeToHostMs` (30 000).                                                         |
 | `output`                   | OutputDefinition   | —                             | Structured output definition (`Output.object(…)` or `Output.string(…)`). Requires `maxIterations === 1`. See [Structured output](#structured-output).                                                                        |
+| `labels`                   | RunEventLabels     | —                             | Free-form tags (`Record<string, string \| number \| boolean>`) carried on the run's `runStarted` event. See [Run events](#run-events).                                                                                       |
+| `events`                   | RunEventsOption    | NDJSON file                   | `false` to disable run events, or `{ onEvent?, file? }` — `file` is `true` (default path), a path, or `false`. See [Run events](#run-events).                                                                                |
 
 ### `RunResult`
 

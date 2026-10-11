@@ -1,6 +1,7 @@
 import { Deferred, Duration, Effect, Fiber } from "effect";
 import { AgentStreamEmitter } from "./AgentStreamEmitter.js";
 import { Display } from "./Display.js";
+import { currentRunEvents } from "./RunEvents.js";
 import { preprocessPrompt } from "./PromptPreprocessor.js";
 import {
   AgentError,
@@ -36,6 +37,7 @@ const invokeAgent = (
   resumeSession?: string,
   forkSession?: boolean,
   signal?: AbortSignal,
+  onCompletionDetected?: (signal: string) => void,
 ): Effect.Effect<
   { result: string; sessionId?: string; usage?: IterationUsage },
   SandboxError
@@ -174,13 +176,16 @@ const invokeAgent = (
           // Check for the completion signal AFTER parsing this line so the
           // accumulator contains everything seen so far. Flip to the
           // completion-grace timer the first time the signal appears.
-          if (
-            !completionDetected &&
-            completionSignals.some((sig) => accumulatedOutput.includes(sig))
-          ) {
-            completionDetected = true;
-            interruptFiber(warningFiber);
-            warningFiber = null;
+          if (!completionDetected) {
+            const seen = completionSignals.find((sig) =>
+              accumulatedOutput.includes(sig),
+            );
+            if (seen !== undefined) {
+              completionDetected = true;
+              interruptFiber(warningFiber);
+              warningFiber = null;
+              onCompletionDetected?.(seen);
+            }
           }
           resetTimer();
         },
@@ -327,6 +332,7 @@ export const orchestrate = (
     const factory = yield* SandboxFactory;
     const display = yield* Display;
     const streamEmitter = yield* AgentStreamEmitter;
+    const runEvents = yield* currentRunEvents;
     const { hostRepoDir, iterations, hooks, prompt, branch, provider } =
       options;
     let completionSignals: string[];
@@ -355,6 +361,7 @@ export const orchestrate = (
     for (let i = 1; i <= iterations; i++) {
       yield* checkAbort();
       yield* display.status(label(`Iteration ${i}/${iterations}`), "info");
+      runEvents.emit({ type: "iterationStarted", iteration: i });
 
       const sandboxResult = yield* factory.withSandbox(
         (
@@ -414,10 +421,16 @@ export const orchestrate = (
                     );
 
                 yield* display.status(label("Agent started"), "success");
+                runEvents.emit({ type: "agentStarted", iteration: i });
 
                 // Invoke the agent — buffer text deltas so Pi's single-token
                 // chunks are displayed as readable multi-word lines.
                 const textBuffer = new TextDeltaBuffer((chunk) => {
+                  runEvents.emit({
+                    type: "agentText",
+                    iteration: i,
+                    message: chunk,
+                  });
                   Effect.runPromise(display.textChunk(chunk));
                   Effect.runPromise(
                     streamEmitter.emit({
@@ -433,6 +446,12 @@ export const orchestrate = (
                 };
                 const onToolCall = (name: string, formattedArgs: string) => {
                   textBuffer.flush();
+                  runEvents.emit({
+                    type: "toolCall",
+                    iteration: i,
+                    name,
+                    formattedArgs,
+                  });
                   Effect.runPromise(display.toolCall(name, formattedArgs));
                   Effect.runPromise(
                     streamEmitter.emit({
@@ -455,13 +474,31 @@ export const orchestrate = (
                   );
                 };
                 const onIdleWarning = (minutes: number) => {
+                  runEvents.emit({
+                    type: "idleWarning",
+                    iteration: i,
+                    idleMinutes: minutes,
+                    idleTimeoutSeconds: idleTimeoutMs / 1000,
+                  });
                   const msg =
                     minutes === 1
                       ? "Agent idle for 1 minute"
                       : `Agent idle for ${minutes} minutes`;
                   Effect.runPromise(display.status(label(msg), "warn"));
                 };
+                const onCompletionDetected = (signal: string) => {
+                  runEvents.emit({
+                    type: "completionSignal",
+                    iteration: i,
+                    signal,
+                  });
+                };
                 const onCompletionTimeout = (timeoutMs: number) => {
+                  runEvents.emit({
+                    type: "hangingProcess",
+                    iteration: i,
+                    completionTimeoutSeconds: timeoutMs / 1000,
+                  });
                   Effect.runPromise(
                     display.status(
                       label(
@@ -492,12 +529,14 @@ export const orchestrate = (
                   iterationResumeSession,
                   iterationForkSession,
                   options.signal,
+                  onCompletionDetected,
                 );
 
                 // Flush any remaining buffered text deltas
                 textBuffer.dispose();
 
                 yield* display.status(label("Agent stopped"), "info");
+                runEvents.emit({ type: "agentStopped", iteration: i });
 
                 // Capture session while sandbox is still alive. Usage from the
                 // stream (e.g. Codex's turn.completed) is the baseline; a
@@ -570,6 +609,18 @@ export const orchestrate = (
         sessionId: lifecycleResult.result.sessionId,
         sessionFilePath: lifecycleResult.result.sessionFilePath,
         usage: lifecycleResult.result.usage,
+      });
+
+      for (const { sha } of lifecycleResult.commits) {
+        runEvents.emit({ type: "commit", iteration: i, sha });
+      }
+      runEvents.emit({
+        type: "iterationFinished",
+        iteration: i,
+        sessionId: lifecycleResult.result.sessionId,
+        sessionFilePath: lifecycleResult.result.sessionFilePath,
+        usage: lifecycleResult.result.usage,
+        commits: lifecycleResult.commits.length,
       });
 
       if (lifecycleResult.result.completionSignal !== undefined) {

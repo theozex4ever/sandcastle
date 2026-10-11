@@ -78,6 +78,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // defeats the per-issue review.
     const implement = await sandbox.run({
       name: "implementer",
+      // Labels group this run's events on the dashboard (see README: Run events).
+      labels: { phase: "implement", cycle: iteration },
       maxIterations: 1,
       agent: sandcastle.claudeCode("claude-sonnet-4-6"),
       promptFile: "./.sandcastle/implement-prompt.md",
@@ -102,6 +104,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // -----------------------------------------------------------------------
     await sandbox.run({
       name: "reviewer",
+      labels: { phase: "review", cycle: iteration },
       maxIterations: 1,
       agent: sandcastle.claudeCode("claude-sonnet-4-6"),
       promptFile: "./.sandcastle/review-prompt.md",
