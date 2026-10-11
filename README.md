@@ -763,7 +763,7 @@ Every `run()`, `sandbox.run()` and `wt.run()` emits a structured stream of **run
 .sandcastle/events/<sessionId>.ndjson
 ```
 
-All runs made by one process share a `sessionId`, so a whole template script (planner, parallel implementers, reviewers, merger) lands in a single file. Set `SANDCASTLE_SESSION_ID` to choose the id yourself, or `SANDCASTLE_EVENTS=0` to turn the default file off.
+The events directory carries its own `.gitignore`, so event files stay untracked even in projects scaffolded before it existed. All runs made by one process share a `sessionId`, so a whole template script (planner, parallel implementers, reviewers, merger) lands in a single file. Set `SANDCASTLE_SESSION_ID` to choose the id yourself, or `SANDCASTLE_EVENTS=0` to turn the default file off.
 
 ```typescript
 import { run, claudeCode, type RunEvent } from "@ai-hero/sandcastle";
@@ -776,7 +776,8 @@ await run({
   // Tags for grouping — Sandcastle does not interpret them.
   labels: { phase: "implement", issue: "42", cycle: 1 },
   events: {
-    // Also receive every event in-process (errors thrown here are swallowed).
+    // Also receive every event in-process. Sync throws and async rejections
+    // are swallowed; returned promises are not awaited.
     onEvent: (event: RunEvent) => {
       if (event.type === "toolCall")
         console.log(event.name, event.formattedArgs);
@@ -789,21 +790,21 @@ await run({
 
 Every event carries an envelope — `v` (schema version), `ts`, `sessionId`, `runId`, `seq` — plus a `type`:
 
-| Type                                               | When                                                                                                     |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `runStarted`                                       | Run begins. Carries `name`, `labels`, `agent`, `model`, `sandbox`, `branchStrategy`, `branch`.           |
-| `iterationStarted` / `iterationFinished`           | Each iteration. `iterationFinished` carries `sessionId`, `usage` (when the agent reports it), `commits`. |
-| `worktreeReady`                                    | Worktree created (`reused: true` when a `createWorktree`/`createSandbox` handle is reused).              |
-| `copyToWorktreeStarted` / `copyToWorktreeFinished` | `copyToWorktree` paths copied.                                                                           |
-| `sandboxStarting` / `sandboxReady`                 | Sandbox provisioned (`reused: true` for `sandbox.run()`).                                                |
-| `hookStarted` / `hookFinished`                     | Each lifecycle hook, with `hook`, `where` (`host`/`sandbox`), `command`, `durationMs`, `ok`.             |
-| `agentStarted` / `agentStopped`                    | Agent process invoked / exited.                                                                          |
-| `agentText` / `toolCall`                           | Agent output.                                                                                            |
-| `idleWarning`                                      | Agent silent for another minute; carries `idleTimeoutSeconds` for countdowns.                            |
-| `completionSignal` / `hangingProcess`              | Completion signal seen / process force-completed after the completion timeout.                           |
-| `commit`                                           | One per commit collected after an iteration.                                                             |
-| `structuredOutput`                                 | Parsed [structured output](#structured-output).                                                          |
-| `runFinished` / `runFailed`                        | Outcome. `runFailed` carries `errorTag` (e.g. `AgentIdleTimeoutError`), `message`, `aborted`.            |
+| Type                                               | When                                                                                                          |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `runStarted`                                       | Run begins. Carries `name`, `labels`, `agent`, `model`, `sandbox`, `branchStrategy`, `branch`.                |
+| `iterationStarted` / `iterationFinished`           | Each iteration. `iterationFinished` carries `agentSessionId`, `usage` (when the agent reports it), `commits`. |
+| `worktreeReady`                                    | Worktree created (`reused: true` when a `createWorktree`/`createSandbox` handle is reused).                   |
+| `copyToWorktreeStarted` / `copyToWorktreeFinished` | `copyToWorktree` paths copied.                                                                                |
+| `sandboxStarting` / `sandboxReady`                 | Sandbox provisioned (`reused: true` for `sandbox.run()`).                                                     |
+| `hookStarted` / `hookFinished`                     | Each lifecycle hook, with `hook`, `where` (`host`/`sandbox`), `command`, `durationMs`, `ok`.                  |
+| `agentStarted` / `agentStopped`                    | Agent process invoked / exited.                                                                               |
+| `agentText` / `toolCall`                           | Agent output.                                                                                                 |
+| `idleWarning`                                      | Agent silent for another minute; carries `idleTimeoutSeconds` for countdowns.                                 |
+| `completionSignal` / `hangingProcess`              | Completion signal seen / process force-completed after the completion timeout.                                |
+| `commit`                                           | One per commit collected after an iteration.                                                                  |
+| `structuredOutput`                                 | Parsed [structured output](#structured-output).                                                               |
+| `runFinished` / `runFailed`                        | Outcome. `runFailed` carries `errorTag` (e.g. `AgentIdleTimeoutError`), `message`, `aborted`.                 |
 
 `runStarted` is emitted once setup validation has passed; configuration errors thrown synchronously by `run()` (missing prompt file, invalid options) do not produce events. `interactive()` sessions are not instrumented.
 

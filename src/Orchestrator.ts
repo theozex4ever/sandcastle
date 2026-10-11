@@ -530,13 +530,19 @@ export const orchestrate = (
                   iterationForkSession,
                   options.signal,
                   onCompletionDetected,
+                ).pipe(
+                  // On success, failure and interruption alike: flush buffered
+                  // text deltas and mark the agent stopped, so no agent output
+                  // can surface after the run's outcome event.
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      textBuffer.dispose();
+                      runEvents.emit({ type: "agentStopped", iteration: i });
+                    }),
+                  ),
                 );
 
-                // Flush any remaining buffered text deltas
-                textBuffer.dispose();
-
                 yield* display.status(label("Agent stopped"), "info");
-                runEvents.emit({ type: "agentStopped", iteration: i });
 
                 // Capture session while sandbox is still alive. Usage from the
                 // stream (e.g. Codex's turn.completed) is the baseline; a
@@ -617,7 +623,7 @@ export const orchestrate = (
       runEvents.emit({
         type: "iterationFinished",
         iteration: i,
-        sessionId: lifecycleResult.result.sessionId,
+        agentSessionId: lifecycleResult.result.sessionId,
         sessionFilePath: lifecycleResult.result.sessionFilePath,
         usage: lifecycleResult.result.usage,
         commits: lifecycleResult.commits.length,

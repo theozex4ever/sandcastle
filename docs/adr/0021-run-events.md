@@ -9,7 +9,7 @@ Sandcastle's progress was only visible as human-readable output (the `Display` s
 - **Labels are opaque.** Sandcastle has no notion of phases, issues or cycles — the user's script owns the pipeline shape. `labels` lets the script tag runs so observers can reconstruct it; Sandcastle never interprets them.
 - **Optional Effect service.** Emission sites (`startSandbox`, `runHostHooks`, the lifecycle's hooks, `SandboxFactory`, `orchestrate`) read the `RunEvents` service via `Effect.serviceOption`, falling back to a no-op. No existing signature gains a requirement, so code paths outside a run (and existing tests) need no wiring.
 - **Public types stay Effect-free.** `RunEvent` and friends are plain TypeScript; the `RunEvents` tag is internal.
-- **Observability never breaks a run.** File I/O errors and throwing callbacks are swallowed.
+- **Observability never breaks a run.** File I/O errors, throwing callbacks and rejected callback promises (never awaited) are swallowed.
 
 ## Considered alternatives
 
@@ -21,4 +21,5 @@ Sandcastle's progress was only visible as human-readable output (the `Display` s
 - `runStarted` is emitted after setup validation, so synchronous configuration errors (missing prompt file, invalid options) produce no events.
 - Token usage arrives only on `iterationFinished`, and only for providers that report it — live cost views have a lag of one iteration.
 - `interactive()` is not instrumented.
-- Event files accumulate under `.sandcastle/events/`; `sandcastle init` adds the directory to `.sandcastle/.gitignore`.
+- Event files accumulate under `.sandcastle/events/`. The directory carries its own `.gitignore` (`*`), written before the first event, so event files stay untracked even in repos whose `.sandcastle/.gitignore` predates the `events/` entry; otherwise an agent's `git add .` in head mode would commit them. `sandcastle init` also adds `events/` to `.sandcastle/.gitignore`.
+- The envelope's `sessionId` is the process (run session) id; the agent's own session id travels as `agentSessionId` on `iterationFinished`, so the two can never collide.

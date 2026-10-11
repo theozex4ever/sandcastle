@@ -361,3 +361,132 @@ describe("describeRunError with Effect failures", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regressions from PR #1 review
+// ---------------------------------------------------------------------------
+
+describe("run events review regressions", () => {
+  it("keeps the envelope sessionId on every event, including iterationFinished", async () => {
+    const repo = makeRepo();
+    const seen: RunEvent[] = [];
+    await run({
+      agent: scriptedAgent("echo 'TEXT:done'"),
+      sandbox: noSandbox(),
+      cwd: repo,
+      prompt: "noop",
+      maxIterations: 2,
+      logging: { type: "file", path: join(repo, ".sandcastle", "test.log") },
+      events: { onEvent: (e) => seen.push(e) },
+    });
+
+    const processSession = getRunEventSessionId();
+    expect(seen.length).toBeGreaterThan(0);
+    for (const event of seen) expect(event.sessionId).toBe(processSession);
+    const finished = seen.filter((e) => e.type === "iterationFinished");
+    expect(finished).toHaveLength(2);
+    // The scripted agent reports no agent session.
+    for (const e of finished)
+      expect(e).not.toHaveProperty("agentSessionId", expect.anything());
+
+    const fileEvents = readNdjson(
+      defaultRunEventsFilePath(repo, processSession),
+    );
+    for (const event of fileEvents)
+      expect(event.sessionId).toBe(processSession);
+  });
+
+  it("does not let an agent commit event files in repos with a pre-events .gitignore", async () => {
+    const repo = tempDir("run-events-oldignore-");
+    execSync(
+      [
+        "git init -q -b main",
+        "git config user.email t@example.com",
+        "git config user.name Test",
+        "mkdir -p .sandcastle",
+        // The .sandcastle/.gitignore scaffolded before events/ was added.
+        "printf '.env\\nlogs/\\nworktrees/\\n' > .sandcastle/.gitignore",
+        "git add -A",
+        "git commit -q -m init",
+      ].join(" && "),
+      { cwd: repo },
+    );
+
+    await run({
+      agent: scriptedAgent(
+        "echo hi > f.txt && git add . && git commit -qm feat && echo 'TEXT:done'",
+      ),
+      sandbox: noSandbox(),
+      cwd: repo,
+      prompt: "commit everything",
+      logging: {
+        type: "file",
+        path: join(repo, ".sandcastle", "logs", "t.log"),
+      },
+    });
+
+    const committed = execSync("git show --name-only --format= HEAD", {
+      cwd: repo,
+    })
+      .toString()
+      .trim()
+      .split("\n");
+    expect(committed).toEqual(["f.txt"]);
+    expect(execSync("git status --porcelain", { cwd: repo }).toString()).toBe(
+      "",
+    );
+    expect(
+      readFileSync(join(repo, ".sandcastle", "events", ".gitignore"), "utf8"),
+    ).toContain("*");
+  });
+
+  it("flushes buffered text and emits agentStopped before runFailed", async () => {
+    const repo = makeRepo();
+    const seen: RunEvent[] = [];
+    // "short" has no sentence boundary or newline, so it sits in the text buffer.
+    await expect(
+      run({
+        agent: scriptedAgent("echo 'TEXT:short' && exit 3"),
+        sandbox: noSandbox(),
+        cwd: repo,
+        prompt: "fail",
+        logging: { type: "file", path: join(repo, ".sandcastle", "test.log") },
+        events: { file: false, onEvent: (e) => seen.push(e) },
+      }),
+    ).rejects.toThrow();
+
+    const typesAtRejection = seen.map((e) => e.type);
+    expect(typesAtRejection.slice(-3)).toEqual([
+      "agentText",
+      "agentStopped",
+      "runFailed",
+    ]);
+    // Nothing trickles in after the outcome (TextDeltaBuffer debounce is ~100ms).
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(seen.map((e) => e.type)).toEqual(typesAtRejection);
+  });
+
+  it("swallows rejections from async onEvent callbacks", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const emitter = createRunEventEmitter({
+        hostRepoDir: tempDir("run-events-"),
+        events: {
+          file: false,
+          onEvent: async () => {
+            throw new Error("broken async forwarder");
+          },
+        },
+      });
+      expect(() =>
+        emitter.emit({ type: "iterationStarted", iteration: 1 }),
+      ).not.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});

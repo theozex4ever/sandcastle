@@ -11,7 +11,7 @@
 
 import { Cause, Context, Effect, Option, Runtime } from "effect";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -134,7 +134,8 @@ export type RunEventPayload =
   | {
       readonly type: "iterationFinished";
       readonly iteration: number;
-      readonly sessionId?: string;
+      /** The agent's own session id (e.g. Claude Code's), when captured. Distinct from the envelope's `sessionId`. */
+      readonly agentSessionId?: string;
       readonly sessionFilePath?: string;
       readonly usage?: RunEventUsage;
       readonly commits: number;
@@ -186,10 +187,11 @@ export type RunEventsOption =
   | false
   | {
       /**
-       * Invoked synchronously for every event. Errors thrown by the callback
-       * are swallowed so a broken forwarder cannot kill the run.
+       * Invoked synchronously for every event. Errors thrown by the callback —
+       * and rejections of a returned promise, which is not awaited — are
+       * swallowed so a broken forwarder cannot kill the run.
        */
-      readonly onEvent?: (event: RunEvent) => void;
+      readonly onEvent?: (event: RunEvent) => unknown;
       /**
        * NDJSON sink. `true` (default) writes to
        * `<cwd>/.sandcastle/events/<sessionId>.ndjson`; a string writes to that
@@ -251,6 +253,21 @@ const isFileSinkDisabledByEnv = (): boolean => {
   return v === "0" || v === "false" || v === "off" || v === "no";
 };
 
+/**
+ * Drop a `.gitignore` containing `*` into the events directory so event files
+ * stay untracked even in repos whose `.sandcastle/.gitignore` predates the
+ * `events/` entry — otherwise an agent's `git add .` would commit them.
+ */
+const ensureSelfIgnoringDir = (dir: string): void => {
+  const marker = join(dir, ".gitignore");
+  if (!existsSync(marker)) {
+    writeFileSync(
+      marker,
+      "# Created by Sandcastle: run event files are local artifacts.\n*\n",
+    );
+  }
+};
+
 /** @internal Default NDJSON path for a session under a host repo. */
 export const defaultRunEventsFilePath = (
   hostRepoDir: string,
@@ -280,24 +297,27 @@ export const createRunEventEmitter = (args: {
   } else if (fileOpt && !isFileSinkDisabledByEnv()) {
     filePath = defaultRunEventsFilePath(args.hostRepoDir, sessionId);
   }
+  const isDefaultPath = typeof fileOpt !== "string";
 
   let fileReady = false;
   const onEvent = args.events?.onEvent;
 
   const emit = (payload: RunEventPayload): void => {
+    // Envelope fields are spread last so a payload can never shadow them.
     const event = {
+      ...payload,
       v: RUN_EVENT_SCHEMA_VERSION,
       ts: new Date().toISOString(),
       sessionId,
       runId,
       seq: ++seqCounter,
-      ...payload,
     } as RunEvent;
 
     if (filePath) {
       try {
         if (!fileReady) {
           mkdirSync(dirname(filePath), { recursive: true });
+          if (isDefaultPath) ensureSelfIgnoringDir(dirname(filePath));
           fileReady = true;
         }
         appendFileSync(filePath, JSON.stringify(event) + "\n");
@@ -307,7 +327,15 @@ export const createRunEventEmitter = (args: {
     }
     if (onEvent) {
       try {
-        onEvent(event);
+        const returned = onEvent(event);
+        if (
+          returned !== null &&
+          typeof returned === "object" &&
+          typeof (returned as PromiseLike<unknown>).then === "function"
+        ) {
+          // Swallow async failures too — never awaited, never unhandled.
+          (returned as PromiseLike<unknown>).then(undefined, () => {});
+        }
       } catch {
         // Swallow — a broken forwarder must not kill the run.
       }
