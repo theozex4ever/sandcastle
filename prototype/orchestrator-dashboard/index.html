@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PROTOTYPE · Sandcastle orchestrator dashboard</title>
+<!--
+  PROTOTYPE — throwaway, do not ship.
+
+  Question: what should a Sandcastle orchestrator dashboard ("software factory" view) look like?
+
+  Four structurally different variants on one page, switchable via ?variant=A|B|C|D
+  (floating bar at the bottom, or ← / →):
+    A  Factory floor   — kanban columns per phase, agent cards, run detail in a drawer
+    B  Pipeline graph  — DAG of planner → implementers → reviewers → merger, per cycle
+    C  Timeline        — Gantt of every run: provisioning, hooks, iterations, idle gaps
+    D  Terminal wall   — tmux-style live panes for every active agent
+    E  Combined        — the chosen direction: B's graph + C's timeline as tabs (t), D's pane as
+                         the detail view, dark-mode toggle (d). Default variant.
+
+  Every variant renders from the same fake RunEvent NDJSON stream (a parallel-planner-with-review
+  session, 3 cycles, one idle-timeout failure) replayed in memory. The event schema is also under
+  test: toggle "{ } events" to see the wire format a real `.sandcastle/events/*.ndjson` would hold.
+
+  Run it: open this file in a browser. No server, no build, no persistence.
+-->
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--soft:#f1f5f9;
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-size:13px}
+button{font:inherit;cursor:pointer}
+.mono,.ln,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+/* status colours */
+.st-provisioning{--c:#94a3b8}.st-setup{--c:#8b5cf6}.st-working{--c:#2563eb}.st-quiet{--c:#d97706}
+.st-wrapping{--c:#0d9488}.st-done{--c:#16a34a}.st-failed{--c:#dc2626}.st-queued{--c:#94a3b8}
+.st-waiting{--c:#cbd5e1}.st-skipped{--c:#cbd5e1}.st-none{--c:#cbd5e1}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--c);flex:none}
+.dot.live{animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 60%,transparent)}100%{box-shadow:0 0 0 7px transparent}}
+.pill{font-size:11px;padding:1px 7px;border-radius:999px;white-space:nowrap;
+  background:color-mix(in srgb,var(--c) 15%,transparent);color:color-mix(in srgb,var(--c) 80%,black)}
+.dark .pill{color:color-mix(in srgb,var(--c) 70%,white)}
+
+/* shared run detail */
+.rd{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--panel)}
+.rd.empty{align-items:center;justify-content:center;color:var(--muted)}
+.rd-head{padding:12px 16px 10px;border-bottom:1px solid var(--line)}
+.rd-title{display:flex;align-items:center;gap:8px;font-size:15px}
+.rd-title .x{margin-left:auto;border:0;background:none;color:var(--muted);font-size:15px}
+.rd-meta{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:8px}
+.kv{font-size:12px}.kv i{font-style:normal;color:var(--muted);margin-right:5px}
+.warn,.errbox{margin-top:8px;padding:6px 10px;border-radius:6px;font-size:12px}
+.warn{background:#fef3c7;color:#92400e}.errbox{background:#fee2e2;color:#991b1b}
+.dark .warn{background:#3a2a0a;color:#fbbf24}.dark .errbox{background:#3b1010;color:#fca5a5}
+.rd-tabs{display:flex;gap:2px;padding:0 10px;border-bottom:1px solid var(--line)}
+.rd-tab{padding:8px 10px;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted)}
+.rd-tab.on{border-color:var(--ink);color:var(--ink);font-weight:600}
+.rd-tab .n{font-size:11px;color:var(--muted);margin-left:2px}
+.rd-body{flex:1;overflow:auto;min-height:0;padding:6px 0 70px}
+.ln{display:flex;gap:10px;padding:1px 16px;font-size:12px;line-height:1.6}
+.ln .ts{color:var(--muted);flex:none;width:40px}
+.ln .tx{white-space:pre-wrap;word-break:break-word}
+.k-sys .tx{color:var(--muted)}.k-tool .tx{color:#0369a1}.k-commit .tx{color:#15803d}
+.k-err .tx{color:#b91c1c;font-weight:600}.k-hook .tx{color:#7c3aed}.k-out .tx{color:#a16207}
+.dark .k-tool .tx{color:#67e8f9}.dark .k-commit .tx{color:#4ade80}.dark .k-err .tx{color:#f87171}
+.dark .k-hook .tx{color:#c4b5fd}.dark .k-out .tx{color:#fcd34d}
+.cursor{animation:blink 1s steps(1) infinite}@keyframes blink{50%{opacity:0}}
+table.it{border-collapse:collapse;width:100%;font-size:12px}
+.it th,.it td{text-align:left;padding:6px 16px;border-bottom:1px solid var(--line)}.it th{color:var(--muted);font-weight:500}
+.cmt{display:flex;gap:10px;padding:6px 16px;border-bottom:1px solid var(--line)}.cmt .mono{color:#15803d}.cmt span:last-child{margin-left:auto;color:var(--muted)}
+pre.nd{margin:0;padding:6px 16px;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--muted)}
+.none{padding:16px;color:var(--muted)}
+
+/* ---------- A: factory floor ---------- */
+.vA{display:flex;flex-direction:column;height:100vh}
+.a-top{display:flex;justify-content:space-between;align-items:center;gap:24px;padding:14px 22px;background:var(--panel);border-bottom:1px solid var(--line)}
+.a-title{font-size:16px;font-weight:700}.a-title span{color:var(--muted);font-weight:400}
+.a-sub{color:var(--muted);font-size:12px;margin-top:2px}.fin{color:#15803d}
+.tiles{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.tile{background:var(--soft);border-radius:8px;padding:6px 12px;min-width:78px}
+.tile i{display:block;font-style:normal;font-size:11px;color:var(--muted)}.tile b{font-size:16px}
+.board{flex:1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding:16px 22px 70px;min-height:0}
+.col{display:flex;flex-direction:column;min-height:0;background:#eef1f5;border-radius:12px}
+.col header{display:flex;justify-content:space-between;padding:10px 14px}.col header span{color:var(--muted);font-size:12px}
+.col-body{flex:1;overflow:auto;padding:0 10px 10px}
+.col-empty{color:var(--muted);padding:6px}
+.cg{margin-bottom:10px}.cg.old{opacity:.55}
+.cg-h{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:6px 4px}
+.card{background:var(--panel);border-radius:10px;padding:10px 12px;margin-bottom:8px;border:1px solid var(--line);border-left:3px solid var(--c);cursor:pointer}
+.card:hover{box-shadow:0 2px 10px #0f172a14}.card.sel{outline:2px solid var(--ink)}
+.card-top{display:flex;align-items:center;gap:7px}
+.card-name{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card-meta{color:var(--muted);font-size:12px;margin-top:4px}
+.card-act{font-size:11.5px;margin-top:6px;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pips{display:flex;align-items:center;gap:3px;margin-top:8px}
+.pips i{width:14px;height:4px;border-radius:2px;background:var(--c)}.pips i.c{animation:fade 1s infinite alternate}
+.pips span{margin-left:6px;font-size:11px;color:var(--muted)}
+@keyframes fade{to{opacity:.3}}
+.card.ph{background:transparent;border:1px dashed #cbd5e1;cursor:default;color:var(--muted)}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(540px,46vw);box-shadow:-8px 0 30px #0f172a22;z-index:5}
+
+/* ---------- B: pipeline graph ---------- */
+.vB{display:grid;grid-template-rows:auto 1fr 42vh;height:100vh}
+.b-top{display:flex;gap:18px;align-items:center;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.b-top b{color:var(--ink)}.b-top .t{font-size:14px;color:var(--ink);font-weight:700}
+.b-graph{overflow:auto;background:radial-gradient(#d8dee8 1px,transparent 1px) 0 0/18px 18px}
+.canvas{position:relative;margin:0 auto}
+.canvas svg{position:absolute;left:0;top:0;overflow:visible}
+.band{position:absolute;left:0;right:0;border-top:1px dashed #cbd5e1}
+.band span{position:absolute;left:4px;top:5px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.node{position:absolute;background:var(--panel);border:1px solid var(--line);border-top:3px solid var(--c);border-radius:10px;padding:7px 10px;box-shadow:0 1px 3px #0f172a12;cursor:pointer;overflow:hidden}
+.node.ghost{background:#f8fafc;border-style:dashed;cursor:default;opacity:.85}
+.node.sel{outline:2px solid var(--ink)}
+.nd-top{display:flex;align-items:center;gap:6px}.nd-top b{flex:1;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nd-st{font-size:11px;color:var(--muted)}
+.nd-sub{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.nd-act{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px;color:#334155}
+path.e{fill:none;stroke-width:2}
+.e.idle{stroke:#cbd5e1}.e.skip{stroke:#dbe1e8;stroke-dasharray:2 4}.e.done{stroke:#86efac}
+.e.fail{stroke:#fca5a5;stroke-dasharray:6 4}
+.e.flow{stroke:#2563eb;stroke-dasharray:8 6;animation:flow .6s linear infinite}@keyframes flow{to{stroke-dashoffset:-14}}
+.e.loop{stroke-dasharray:3 5}
+.loop-lab{position:absolute;font-size:11px;color:var(--muted)}
+.b-detail{border-top:1px solid var(--line);min-height:0}
+
+/* ---------- C: timeline ---------- */
+.vC{display:grid;grid-template-rows:auto 1fr 38vh;height:100vh}
+.c-top{display:flex;align-items:center;gap:18px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.c-top .t{font-size:14px;color:var(--ink);font-weight:700}.c-top b{color:var(--ink)}
+.legend{display:flex;gap:12px;font-size:11.5px;margin-left:auto}
+.legend .cm-key{background:#16a34a}
+.legend i{display:inline-block;width:14px;height:8px;border-radius:2px;margin-right:4px;vertical-align:middle}
+.gantt{overflow:auto;background:var(--panel)}
+.g-axis{position:sticky;top:0;z-index:2;background:var(--panel);display:grid;grid-template-columns:270px 1fr;height:30px;border-bottom:1px solid var(--line)}
+.g-axis .g-lab{color:var(--muted);font-size:11px}
+.g-scale{position:relative;margin-right:24px;cursor:ew-resize}
+.g-scale span{position:absolute;bottom:5px;font-size:11px;color:var(--muted);transform:translateX(-50%)}
+.g-row{display:grid;grid-template-columns:270px 1fr;height:28px;align-items:center;border-bottom:1px solid #f1f5f9;cursor:pointer}
+.g-row:hover{background:#f8fafc}.g-row.sel{background:#eff6ff}.g-row.ghost{cursor:default}
+.g-row.hdr{height:26px;background:var(--soft);cursor:default;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+.g-lab{display:flex;align-items:center;gap:7px;padding:0 12px;white-space:nowrap;overflow:hidden;font-size:12px}
+.g-lab small{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.g-track{position:relative;height:100%;margin-right:24px}
+.seg{position:absolute;top:7px;height:14px;border-radius:3px}
+.sg-provision{background:#cbd5e1}
+.sg-setup{background:repeating-linear-gradient(45deg,#c4b5fd,#c4b5fd 4px,#ddd6fe 4px,#ddd6fe 8px)}
+.sg-iter{background:#3b82f6}.sg-iter.alt{background:#60a5fa}
+.sg-idle{background:repeating-linear-gradient(45deg,#fca5a5,#fca5a5 4px,#fee2e2 4px,#fee2e2 8px)}
+.tick{position:absolute;top:22px;width:1px;height:4px;background:#1e3a8a}
+.cm{position:absolute;top:9px;width:9px;height:9px;background:#16a34a;transform:translateX(-50%) rotate(45deg);border:1.5px solid #fff}
+.endm{position:absolute;top:5px;font-size:12px;margin-left:3px}
+.ph-lab{position:absolute;top:7px;font-size:10.5px;color:var(--muted);border:1px dashed #cbd5e1;border-radius:3px;padding:0 6px;height:14px;line-height:12px;margin-left:4px}
+.phd{position:absolute;top:0;bottom:0;border-left:1.5px solid #ef4444}
+.g-scale .ph-cap{position:absolute;top:3px;bottom:auto;transform:translateX(-50%);background:#ef4444;color:#fff;font-size:10px;border-radius:3px;padding:0 4px}
+.c-detail{border-top:1px solid var(--line);min-height:0}
+
+/* ---------- D: terminal wall ---------- */
+.dark{--bg:#0b0f14;--panel:#0f141b;--ink:#d6dde6;--muted:#6b7785;--line:#1d2630;--soft:#151c25;background:var(--bg);color:var(--ink)}
+.vD{display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto 1fr auto;height:100vh;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.d-status{grid-column:1/-1;display:flex;gap:18px;padding:4px 12px;background:#14532d;color:#bbf7d0;font-size:12px}
+.d-status .grow{flex:1}
+.d-side{grid-row:2/4;border-right:1px solid var(--line);overflow:auto;padding:6px 0 70px}
+.d-cy{padding:10px 12px 3px;font-size:11px;color:var(--muted);text-transform:uppercase}
+.tr{display:flex;align-items:center;gap:7px;padding:3px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
+.tr:hover{background:var(--soft)}.tr.ph{cursor:default;opacity:.45}.tr.sel{background:var(--soft)}
+.tr b{overflow:hidden;text-overflow:ellipsis;font-weight:400}.tr>span:last-child{margin-left:auto;color:var(--muted);font-size:11px}
+.d-main{display:grid;gap:6px;padding:6px;min-height:0;grid-auto-rows:minmax(0,1fr)}
+.pane{display:flex;flex-direction:column;min-height:0;border:1px solid var(--line);border-top:2px solid var(--c);background:var(--panel);border-radius:4px}
+.d-main .pane.st-done,.d-main .pane.st-failed{opacity:.55}
+.pane-h{display:flex;gap:8px;align-items:center;padding:4px 8px;font-size:12px;background:var(--soft);cursor:zoom-in;white-space:nowrap;overflow:hidden}
+.pane-h span{color:var(--muted)}.pane-h .pill{color:color-mix(in srgb,var(--c) 80%,black)}.dark .pane-h .pill{color:color-mix(in srgb,var(--c) 70%,white)}.pane-h .grow{flex:1}.pane-h .q{color:#fbbf24}
+.pane-b{flex:1;overflow:auto;padding:4px 0;min-height:0}
+.pane-b .ln{padding:0 8px;font-size:11.5px;line-height:1.5}
+.d-idle{display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;line-height:1.8}
+.d-dock{display:flex;gap:6px;flex-wrap:wrap;align-content:flex-start;padding:6px 6px 64px;border-top:1px solid var(--line);max-height:140px;overflow:auto}
+.chip{display:flex;gap:6px;align-items:center;padding:2px 8px;border:1px solid var(--line);border-radius:4px;font-size:11.5px;cursor:pointer}
+.chip span{color:var(--muted)}
+.d-max{display:flex;flex-direction:column;min-height:0;padding:6px}
+.d-max-bar button{background:var(--soft);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:3px 10px;margin-bottom:6px}
+.d-max .rd{border:1px solid var(--line);border-radius:4px}
+
+
+/* ---------- E: combined ---------- */
+.vE{display:grid;grid-template-rows:auto minmax(0,1fr) 40vh;height:100vh;background:var(--bg);color:var(--ink)}
+.e-top{display:flex;align-items:center;gap:16px;padding:8px 18px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--muted);flex-wrap:wrap}
+.e-top .t{font-size:14px;font-weight:700;color:var(--ink)}
+.e-tabs{display:flex;gap:2px;background:var(--soft);border-radius:8px;padding:2px}
+.e-tab{border:0;background:none;color:var(--muted);padding:4px 12px;border-radius:6px}
+.e-tab.on{background:var(--panel);color:var(--ink);font-weight:600;box-shadow:0 1px 2px #0002}
+.e-stats{display:flex;gap:14px}.e-stats b{color:var(--ink)}.e-stats .bad b,.e-stats .bad{color:#dc2626}.e-stats .ok{color:#16a34a;font-weight:600}
+.e-top .legend{margin-left:0}
+.e-theme{margin-left:auto;border:1px solid var(--line);background:var(--soft);color:var(--ink);border-radius:999px;padding:4px 12px}
+.e-main{min-height:0}
+.e-detail{min-height:0;padding:6px 6px 64px;border-top:1px solid var(--line);display:flex}
+.e-detail .pane{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.e-detail .pane-h{cursor:default}
+.pane-tabs{display:flex;align-items:center;gap:2px;padding:3px 6px;border-bottom:1px solid var(--line);font-size:11.5px}
+.pt{padding:2px 8px;border-radius:4px;cursor:pointer;color:var(--muted)}.pt.on{background:var(--soft);color:var(--ink)}
+.pt i{font-style:normal;margin-left:5px;opacity:.6}
+.perr{margin-left:auto;color:#dc2626}
+.e-detail .pane-b .ln{padding:0 10px;font-size:12px}
+
+/* dark mode for graph + timeline (variant E) */
+.dark .b-graph{background:radial-gradient(#1f2a36 1px,transparent 1px) 0 0/18px 18px}
+.dark .band{border-color:#263241}
+.dark .node{box-shadow:none}.dark .node.ghost{background:#0c1117}
+.dark .nd-act,.dark .card-act{color:#9fb0c2}
+.dark .e.idle{stroke:#334155}.dark .e.skip{stroke:#263241}.dark .e.done{stroke:#15803d}.dark .e.fail{stroke:#b91c1c}.dark .e.flow{stroke:#60a5fa}
+.dark .st-waiting,.dark .st-skipped,.dark .st-none,.dark .st-queued{--c:#475569}
+.dark .g-row{border-color:var(--line)}.dark .g-row:hover{background:var(--soft)}.dark .g-row.sel{background:#14223a}
+.dark .sg-provision{background:#3b4656}
+.dark .sg-setup{background:repeating-linear-gradient(45deg,#6d28d9,#6d28d9 4px,#4c1d95 4px,#4c1d95 8px)}
+.dark .sg-iter{background:#2563eb}.dark .sg-iter.alt{background:#3b82f6}
+.dark .sg-idle{background:repeating-linear-gradient(45deg,#b91c1c,#b91c1c 4px,#7f1d1d 4px,#7f1d1d 8px)}
+.dark .tick{background:#93c5fd}.dark .cm{border-color:var(--panel)}.dark .ph-lab{border-color:#334155}
+.dark .k-sys .tx{color:#7d8a99}
+.dark .cmt .mono{color:#4ade80}
+
+/* ---------- prototype harness (not part of the design) ---------- */
+#proto-bar{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px 12px;background:#111;color:#fff;border-radius:999px;box-shadow:0 8px 30px #0006;z-index:50;font:12px system-ui,sans-serif;border:1px solid #333;white-space:nowrap}
+#proto-bar button,#proto-bar select{background:#262626;color:#fff;border:0;border-radius:999px;padding:4px 9px}
+#proto-bar .tag{background:#facc15;color:#111;font-weight:800;font-size:10px;padding:2px 6px;border-radius:4px;letter-spacing:.06em}
+#vl{min-width:150px;text-align:center;font-weight:600}
+#sc{width:200px;accent-color:#facc15}
+#tl{font-family:ui-monospace,monospace;min-width:92px}
+.sep{width:1px;height:18px;background:#444}
+#ev.on{background:#facc15;color:#111}
+#raw{position:fixed;left:14px;bottom:64px;width:min(680px,60vw);height:320px;background:#0b0f14f2;color:#cbd5e1;border-radius:10px;z-index:49;display:flex;flex-direction:column;box-shadow:0 8px 30px #0006}
+#raw[hidden]{display:none}
+#raw .raw-h{padding:8px 12px;font:11px system-ui,sans-serif;color:#94a3b8;border-bottom:1px solid #1e293b}
+#raw pre{flex:1;overflow:auto;margin:0;padding:8px 12px;font-size:10.5px;line-height:1.5;white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="raw" hidden></div>
+<div id="proto-bar">
+  <span class="tag">PROTOTYPE</span>
+  <button id="pv" title="Previous variant (←)">◀</button><span id="vl"></span><button id="nx" title="Next variant (→)">▶</button>
+  <span class="sep"></span>
+  <button id="rs" title="Restart">⏮</button><button id="pp" title="Play / pause (space)"></button>
+  <select id="sp" title="Replay speed"><option value="1">1×</option><option value="5">5×</option><option value="15" selected>15×</option><option value="40">40×</option><option value="100">100×</option></select>
+  <input id="sc" type="range" min="0" step="0.1">
+  <span id="tl"></span>
+  <button id="end" title="Jump to end">⏭</button>
+  <button id="ev" title="Show the raw RunEvent stream">{ } events</button>
+</div>
+<script>
+// =====================================================================
+// Fake RunEvent stream: a parallel-planner-with-review session
+// =====================================================================
+const T0 = Date.parse("2026-10-11T14:02:00Z");
+function rng(seed){return()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296}}
+const R=rng(20261011), rnd=(a,b)=>a+R()*(b-a), pick=a=>a[Math.floor(R()*a.length)];
+const hex=n=>Array.from({length:n},()=>"0123456789abcdef"[Math.floor(R()*16)]).join("");
+const uuid=()=>`${hex(8)}-${hex(4)}-${hex(4)}-${hex(4)}-${hex(12)}`;
+const OPUS="claude-opus-4-8", SONNET="claude-sonnet-4-6", IDLE_TIMEOUT=120;
+
+const CYCLES=[[
+  {id:"42",title:"Add rate limiting to /api/upload",branch:"agent/issue-42-rate-limit",iters:3,
+   files:["src/api/upload.ts","src/middleware/rateLimit.ts"],testFile:"src/api/upload.test.ts",check:"npx vitest run src/api/upload.test.ts",
+   grep:'"rateLimit" in src/',plan:"Plan: token-bucket middleware keyed by API key, applied to the upload router, 429 + Retry-After.",
+   commits:["feat(upload): token-bucket rate limiter for /api/upload","test(upload): cover 429 + Retry-After header","refactor(rateLimit): make burst size configurable"],
+   followups:["Adding a test for the Retry-After header.","Making the bucket size configurable via RATE_LIMIT_BURST.","Handling the missing-API-key path — falling back to IP."],
+   review:"Diff looks good. One gap: no test for the IP fallback when the API key header is missing.",reviewFix:"test(upload): cover IP fallback when API key is missing"},
+  {id:"57",title:"Fix flaky WorktreeManager test on Windows",branch:"agent/issue-57-flaky-worktree-test",iters:5,
+   files:["src/WorktreeManager.ts","src/WorktreeManager.windowsPath.test.ts"],testFile:"src/WorktreeManager.windowsPath.test.ts",check:"npx vitest run src/WorktreeManager.windowsPath.test.ts --repeat 20",
+   grep:'"lockPath" in src/WorktreeManager.ts',plan:"The test races lock-file cleanup. Plan: await the scope finalizer and normalise separators before comparing.",
+   commits:["fix(worktree): await lock release before asserting cleanup","fix(worktree): normalise path separators in lock names","test(worktree): repeat windows path test to catch the race","refactor(worktree): extract lockPathFor helper","test(worktree): assert stale lock is reclaimed"],
+   followups:["Still flaky 1/20 — the stale-lock check reads the PID before the write is flushed.","Extracting a lockPathFor helper so tests and code agree on separators.","Adding a regression test for the stale-lock reclaim path."],
+   review:"Fix is sound and --repeat 20 shows 0 failures. Approving as-is.",reviewFix:null},
+  {id:"61",title:"Support --cpus on podman provider",branch:"agent/issue-61-podman-cpus",iters:2,failAt:2,
+   files:["src/sandboxes/podman.ts","src/PodmanLifecycle.ts"],testFile:"src/sandboxes/podman.test.ts",check:"npx vitest run src/sandboxes/podman.test.ts",
+   grep:'"cpus" in src/sandboxes/',plan:"Mirror the docker provider: accept cpus?: number and forward --cpus to podman run.",
+   commits:["feat(podman): accept cpus option and forward --cpus"],
+   followups:["Running the podman integration test to confirm the flag is accepted."],review:"",reviewFix:null},
+  {id:"64",title:"Document structured output in README",branch:"agent/issue-64-structured-output-docs",iters:2,
+   files:["README.md","docs/content/docs/structured-output.mdx"],testFile:"README.md",check:"npm run build --prefix docs",
+   grep:'"Output.object" in README.md docs/',plan:"Add a Structured output section with a Zod example and link ADR 0010.",
+   commits:["docs: add structured output section to README","docs: add structured-output page to docs site"],
+   followups:["Adding the docs-site page and cross-linking from the README."],
+   review:"Docs read well. The example imports from 'zod/v4' but the templates use 'zod' — aligning.",reviewFix:"docs: align Zod import with templates"},
+],[
+  {id:"66",title:"Expose onAgentStreamEvent in terminal mode",branch:"agent/issue-66-stream-events-terminal",iters:2,
+   files:["src/run.ts","src/AgentStreamEmitter.ts"],testFile:"src/run.test.ts",check:"npx vitest run src/run.test.ts",
+   grep:'"onAgentStreamEvent" in src/',plan:"Unblocked now #64 landed the docs page it extends. Lift onAgentStreamEvent out of the file-only LoggingOption branch.",
+   commits:["feat(run): allow onAgentStreamEvent in stdout logging mode","test(run): stream events fire in terminal mode"],
+   followups:["Adding a test that terminal mode forwards toolCall events."],
+   review:"Missing a changeset for a user-facing change.",reviewFix:"chore: add changeset for terminal-mode stream events"},
+],[]];
+const PLANNER=[
+  {found:"9 open issues. Checking which ones block each other.",views:["57","61","66"],reason:"#66 is blocked by #64. #70–#73 need human input. 4 issues are unblocked and touch disjoint files."},
+  {found:"5 open issues after the last merge.",views:["66"],reason:"#64 landed, so #66 is unblocked. #61 failed last cycle and is now needs-human — skipping."},
+  {found:"4 open issues.",views:[],reason:"Everything left is needs-human or blocked. Nothing to do."},
+];
+
+const EVENTS=(()=>{
+  const ev=[]; const push=(t,type,o={})=>ev.push({t:Math.round(t*100)/100,type,...o});
+  let n=0;
+  function runAgent(o){
+    const runId=`run_${String(++n).padStart(2,"0")}`;
+    let t=o.start, container=o.container;
+    push(t,"runStarted",{runId,name:o.name,labels:o.labels,agent:"claude-code",model:o.model,sandbox:"docker",branch:o.branch,maxIterations:o.maxIterations});
+    if(!container){
+      if(o.branch!=="HEAD"){t+=rnd(1,2.5);push(t,"worktreeReady",{runId,path:`.sandcastle/worktrees/${o.branch.replace(/\//g,"-")}`,reused:false});}
+      if(o.copy){const d=rnd(4,9);push(t,"copyToWorktreeStarted",{runId,paths:["node_modules"]});t+=d;push(t,"copyToWorktreeFinished",{runId,durationMs:Math.round(d*1000)});}
+      t+=rnd(3,7);container=`sandcastle-${hex(6)}`;push(t,"sandboxReady",{runId,container,image:"sandcastle:local",reused:false});
+      const d=rnd(14,30);push(t,"hookStarted",{runId,where:"sandbox",hook:"onSandboxReady",command:"npm install"});t+=d;
+      push(t,"hookFinished",{runId,command:"npm install",exitCode:0,durationMs:Math.round(d*1000)});
+    } else {t+=rnd(.4,1);push(t,"sandboxReady",{runId,container,reused:true});}
+    const commits=[];
+    for(let i=1;i<=o.iters;i++){
+      t+=rnd(.5,1.5);push(t,"iterationStarted",{runId,iteration:i});
+      const steps=o.script(i);
+      for(let k=0;k<steps.length;k++){
+        const s=steps[k]; t+=s.gap??rnd(2,8);
+        if(o.failAt===i&&k===Math.floor(steps.length/2)){
+          t+=IDLE_TIMEOUT;push(t,"idleTimeout",{runId,iteration:i,idleTimeoutSeconds:IDLE_TIMEOUT});
+          t+=.3;push(t,"runFailed",{runId,iteration:i,error:`No output for ${IDLE_TIMEOUT}s — idle timeout`,commits:commits.length});
+          return {runId,end:t,commits,ok:false,container};
+        }
+        if(s.text)push(t,"agentText",{runId,iteration:i,message:s.text});
+        else if(s.tool)push(t,"toolCall",{runId,iteration:i,name:s.tool,formattedArgs:s.args});
+        else if(s.commit){const c={sha:hex(7),message:s.commit};commits.push(c);push(t,"commit",{runId,iteration:i,...c});}
+        if(s.dur)t+=s.dur;
+      }
+      if(i===o.iters&&o.maxIterations>1){t+=rnd(1,3);push(t,"agentText",{runId,iteration:i,message:"<promise>COMPLETE</promise>"});push(t+.05,"completionSignal",{runId,iteration:i});}
+      t+=rnd(1,3);
+      push(t,"iterationFinished",{runId,iteration:i,sessionId:uuid(),usage:{inputTokens:Math.round(rnd(50,900)),cacheCreationInputTokens:Math.round(rnd(4e3,35e3)),cacheReadInputTokens:Math.round(rnd(60e3,420e3)),outputTokens:Math.round(rnd(1.5e3,14e3))}});
+    }
+    if(o.output){t+=.2;push(t,"structuredOutput",{runId,tag:o.output.tag,value:o.output.value});}
+    t+=rnd(.8,2);push(t,"runFinished",{runId,commits:commits.length});
+    return {runId,end:t,commits,ok:true,container};
+  }
+  const plannerScript=(issues,x)=>()=>[
+    {text:"Reading the open backlog and building a dependency graph."},
+    {tool:"Bash",args:"gh issue list --state open --json number,title,body,labels --limit 50",dur:3},
+    {text:x.found},
+    ...x.views.map(id=>({tool:"Bash",args:`gh issue view ${id} --json body,comments`})),
+    {tool:"Read",args:"CONTEXT.md"},
+    {tool:"Grep",args:'"blocked by #" in issue bodies'},
+    {text:x.reason},
+    {text:`<plan>${JSON.stringify({issues:issues.map(({id,title,branch})=>({id,title,branch}))})}</plan>`},
+  ];
+  const implScript=is=>i=>{
+    if(i===1)return[
+      {text:`Picking up #${is.id}: ${is.title}.`},{tool:"Bash",args:`gh issue view ${is.id}`},
+      {tool:"Read",args:is.files[0]},{tool:"Grep",args:is.grep},{tool:"Read",args:is.files[1]},{text:is.plan},
+      {tool:"Edit",args:is.files[0]},{tool:"Edit",args:is.files[1]},
+      {tool:"Bash",args:"npm run typecheck",dur:rnd(6,10)},{tool:"Bash",args:is.check,dur:rnd(14,26)},
+      {text:"Typecheck and tests pass."},{tool:"Bash",args:`git commit -am "${is.commits[0]}"`},{commit:is.commits[0],gap:.8},
+    ];
+    const c=is.commits[(i-1)%is.commits.length];
+    const s=[{text:pick(is.followups)},{tool:"Read",args:pick(is.files)},{tool:"Edit",args:pick(is.files)},{tool:"Bash",args:is.check,dur:rnd(14,26)}];
+    if(R()<.5)s.push({text:"1 test failing — the assertion assumes POSIX separators. Fixing."},{tool:"Edit",args:is.testFile},{tool:"Bash",args:is.check,dur:rnd(12,20)});
+    s.push({tool:"Bash",args:"npm run typecheck",dur:rnd(6,10)},{tool:"Bash",args:`git commit -am "${c}"`},{commit:c,gap:.8});
+    return s;
+  };
+  const reviewScript=is=>()=>{
+    const s=[{text:`Reviewing ${is.branch} against CODING_STANDARDS.md.`},{tool:"Bash",args:`git diff main...${is.branch} --stat`},
+      {tool:"Read",args:".sandcastle/CODING_STANDARDS.md"},...is.files.map(f=>({tool:"Read",args:f})),{text:is.review}];
+    if(is.reviewFix)s.push({tool:"Edit",args:is.testFile},{tool:"Bash",args:is.check,dur:rnd(12,22)},{tool:"Bash",args:`git commit -am "${is.reviewFix}"`},{commit:is.reviewFix,gap:.8});
+    else s.push({text:"No changes needed. Approving."});
+    return s;
+  };
+  const mergeScript=(branches,conflict)=>()=>{
+    const s=[{text:`Merging ${branches.length} branch${branches.length>1?"es":""} into main.`}];
+    branches.forEach((b,k)=>{
+      s.push({tool:"Bash",args:`git merge --no-ff ${b}`,dur:1});
+      if(conflict&&k===branches.length-1)s.push({text:`Conflict in ${conflict}: both branches edited the API section. Keeping both.`},{tool:"Read",args:conflict},{tool:"Edit",args:conflict},{tool:"Bash",args:`git add ${conflict} && git commit --no-edit`});
+      s.push({commit:`Merge branch '${b}'`,gap:.6});
+    });
+    s.push({tool:"Bash",args:"npm run typecheck",dur:rnd(7,10)},{tool:"Bash",args:"npx vitest run",dur:rnd(35,55)},{text:"All checks green on main."});
+    return s;
+  };
+
+  push(0,"sessionStarted",{sessionId:"s_8f2a1c",template:"parallel-planner-with-review",cwd:"~/code/acme-api",maxCycles:10});
+  let t=1;
+  for(let c=1;c<=CYCLES.length;c++){
+    const issues=CYCLES[c-1];
+    const p=runAgent({name:"planner",labels:{cycle:c,phase:"plan"},model:OPUS,branch:"HEAD",start:t,iters:1,maxIterations:1,
+      script:plannerScript(issues,PLANNER[c-1]),output:{tag:"plan",value:{issues:issues.map(({id,title,branch})=>({id,title,branch}))}}});
+    if(!issues.length){push(p.end+.5,"sessionFinished",{reason:"No unblocked issues to work on."});break;}
+    const ends=[],merged=[];
+    issues.forEach((is,k)=>{
+      const impl=runAgent({name:"implementer",labels:{cycle:c,phase:"implement",issue:is.id},model:SONNET,branch:is.branch,
+        start:p.end+.5+k*rnd(.2,1.2),iters:is.iters,failAt:is.failAt,maxIterations:100,copy:true,script:implScript(is)});
+      let end=impl.end;
+      if(impl.ok&&impl.commits.length){
+        const rev=runAgent({name:"reviewer",labels:{cycle:c,phase:"review",issue:is.id},model:SONNET,branch:is.branch,
+          container:impl.container,start:impl.end+.6,iters:1,maxIterations:1,script:reviewScript(is)});
+        end=rev.end;merged.push(is.branch);
+      }
+      ends.push(end);
+    });
+    const m=runAgent({name:"merger",labels:{cycle:c,phase:"merge",branches:merged.length},model:SONNET,branch:"HEAD",
+      start:Math.max(...ends)+1.5,iters:1,maxIterations:1,script:mergeScript(merged,c===1?"README.md":null)});
+    t=m.end+2;
+  }
+  ev.sort((a,b)=>a.t-b.t);
+  return ev;
+})();
+const END=EVENTS.at(-1).t;
+const toWire=({t,...e})=>({ts:new Date(T0+t*1000).toISOString(),...e});
+
+// =====================================================================
+// Fold events → state at time `now`
+// =====================================================================
+const ACTIVE=new Set(["provisioning","setup","working","quiet","wrapping"]);
+const QUIET_AFTER=40;
+const closeSeg=(r,t)=>{const s=r.segs.at(-1);if(s&&s.end==null)s.end=t;};
+
+function fold(now){
+  const S={now,session:null,finished:null,runs:new Map(),cycles:new Map(),events:[],
+    tot:{iterations:0,commits:0,failed:0,tin:0,tout:0,tools:0}};
+  const cyc=c=>{if(!S.cycles.has(c))S.cycles.set(c,{n:c,plan:null});return S.cycles.get(c);};
+  for(const e of EVENTS){
+    if(e.t>now)break;
+    S.events.push(e);
+    if(e.type==="sessionStarted"){S.session=e;continue;}
+    if(e.type==="sessionFinished"){S.finished=e;continue;}
+    if(e.type==="runStarted"){
+      S.runs.set(e.runId,{runId:e.runId,name:e.name,labels:e.labels,model:e.model,agent:e.agent,sandbox:e.sandbox,branch:e.branch,
+        maxIterations:e.maxIterations,status:"provisioning",startedAt:e.t,endedAt:null,iteration:0,iterations:[],log:[],commits:[],
+        events:[],segs:[{kind:"provision",start:e.t,end:null}],ticks:[],lastOutputAt:e.t,activity:"Provisioning sandbox…",
+        error:null,container:null,tin:0,tout:0});
+      cyc(e.labels.cycle);
+    }
+    const r=S.runs.get(e.runId); if(!r)continue;
+    r.events.push(e);
+    const L=(kind,text)=>r.log.push({t:e.t,kind,text});
+    switch(e.type){
+      case "runStarted":L("sys",`run started · ${e.agent} · ${e.model} · ${e.sandbox} · branch ${e.branch}`);break;
+      case "worktreeReady":L("sys",`worktree ready ${e.path}`);r.activity="Worktree ready";break;
+      case "copyToWorktreeStarted":L("sys",`copying ${e.paths.join(", ")} into worktree…`);r.activity="Copying node_modules…";break;
+      case "copyToWorktreeFinished":L("sys",`copy finished in ${(e.durationMs/1000).toFixed(1)}s`);break;
+      case "sandboxReady":closeSeg(r,e.t);r.segs.push({kind:"setup",start:e.t,end:null});r.status="setup";r.container=e.container;
+        L("sys",e.reused?`reusing sandbox ${e.container}`:`sandbox ready ${e.container} (${e.image})`);r.activity=e.reused?"Reusing sandbox":"Sandbox ready";break;
+      case "hookStarted":L("hook",`$ ${e.command}   [${e.where} · ${e.hook}]`);r.activity=`Hook: ${e.command}`;break;
+      case "hookFinished":L("hook",`✓ ${e.command} exited ${e.exitCode} in ${(e.durationMs/1000).toFixed(1)}s`);break;
+      case "iterationStarted":closeSeg(r,e.t);r.segs.push({kind:"iter",n:e.iteration,start:e.t,end:null});r.status="working";
+        r.iteration=e.iteration;r.iterations.push({n:e.iteration,start:e.t,end:null,usage:null,sessionId:null});
+        L("sys",`── iteration ${e.iteration} ──`);r.lastOutputAt=e.t;r.activity="Starting iteration";break;
+      case "agentText":r.lastOutputAt=e.t;L(e.message.startsWith("<")?"out":"text",e.message);r.activity=e.message;break;
+      case "toolCall":r.lastOutputAt=e.t;r.ticks.push(e.t);S.tot.tools++;L("tool",`${e.name}(${e.formattedArgs})`);r.activity=`${e.name}(${e.formattedArgs})`;break;
+      case "commit":r.lastOutputAt=e.t;r.commits.push({sha:e.sha,message:e.message,t:e.t,iteration:e.iteration});S.tot.commits++;L("commit",`commit ${e.sha} ${e.message}`);break;
+      case "completionSignal":r.status="wrapping";L("sys","completion signal detected");break;
+      case "iterationFinished":{const it=r.iterations.at(-1),u=e.usage;it.end=e.t;it.usage=u;it.sessionId=e.sessionId;
+        const tin=u.inputTokens+u.cacheCreationInputTokens+u.cacheReadInputTokens;
+        r.tin+=tin;r.tout+=u.outputTokens;S.tot.tin+=tin;S.tot.tout+=u.outputTokens;S.tot.iterations++;closeSeg(r,e.t);
+        L("sys",`iteration ${e.iteration} finished · in ${fmtK(tin)} · out ${fmtK(u.outputTokens)} · session ${e.sessionId.slice(0,8)}`);break;}
+      case "idleTimeout":closeSeg(r,r.lastOutputAt);r.segs.push({kind:"idle",start:r.lastOutputAt,end:e.t});L("err",`idle timeout — no output for ${e.idleTimeoutSeconds}s`);break;
+      case "structuredOutput":cyc(r.labels.cycle).plan=e.value;L("sys",`structured output <${e.tag}> parsed · ${e.value.issues.length} issue(s)`);break;
+      case "runFinished":closeSeg(r,e.t);r.status="done";r.endedAt=e.t;L("sys",`run finished · ${e.commits} commit(s)`);
+        r.activity=e.commits?`✓ ${e.commits} commit${e.commits>1?"s":""}`:"✓ no commits";break;
+      case "runFailed":closeSeg(r,e.t);r.status="failed";r.endedAt=e.t;r.error=e.error;S.tot.failed++;L("err",`run failed · ${e.error}`);r.activity=e.error;break;
+    }
+  }
+  for(const r of S.runs.values())if(r.status==="working"&&now-r.lastOutputAt>QUIET_AFTER)r.status="quiet";
+  return S;
+}
+
+// Group runs into cycles/lanes, with placeholders for work the planner promised but that hasn't started.
+function pipeline(S){
+  const runs=[...S.runs.values()];
+  return [...S.cycles.values()].map(c=>{
+    const inC=runs.filter(r=>r.labels.cycle===c.n);
+    const lanes=(c.plan?.issues||[]).map(is=>{
+      const impl=inC.find(r=>r.labels.phase==="implement"&&r.labels.issue===is.id)||null;
+      const rev=inC.find(r=>r.labels.phase==="review"&&r.labels.issue===is.id)||null;
+      const revPh=rev?null:!impl||ACTIVE.has(impl.status)?"waiting":impl.status==="failed"||!impl.commits.length?"skipped":"queued";
+      return {issue:is,impl,rev,implPh:impl?null:"queued",revPh};
+    });
+    const settled=lanes.length&&lanes.every(l=>l.impl&&!ACTIVE.has(l.impl.status)&&(l.rev?!ACTIVE.has(l.rev.status):l.revPh==="skipped"));
+    const merger=inC.find(r=>r.labels.phase==="merge")||null;
+    return {n:c.n,plan:c.plan,planner:inC.find(r=>r.labels.phase==="plan"),merger,lanes,
+      mergePh:merger?null:!c.plan?"waiting":!lanes.length?"none":settled?"queued":"waiting"};
+  });
+}
+
+// =====================================================================
+// Shared helpers
+// =====================================================================
+const fmtT=t=>{t=Math.max(0,Math.floor(t));return `${String(Math.floor(t/60)).padStart(2,"0")}:${String(t%60).padStart(2,"0")}`;};
+const fmtD=s=>s<60?`${Math.round(s)}s`:`${Math.floor(s/60)}m${String(Math.round(s%60)).padStart(2,"0")}s`;
+const tok=n=>n?fmtK(n):"—";
+const fmtK=n=>n>=1e6?(n/1e6).toFixed(2)+"M":n>=1e3?(n/1e3).toFixed(1)+"k":String(n);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const short=m=>m.replace("claude-","");
+const LABEL={provisioning:"provisioning",setup:"setting up",working:"working",quiet:"quiet",wrapping:"wrapping up",done:"done",failed:"failed",queued:"queued",waiting:"waiting",skipped:"skipped",none:""};
+const dot=st=>`<span class="dot st-${st}${ACTIVE.has(st)?" live":""}"></span>`;
+const pill=st=>`<span class="pill st-${st}">${LABEL[st]}</span>`;
+const dur=(S,r)=>(r.endedAt??S.now)-r.startedAt;
+const kv=(k,v)=>`<span class="kv"><i>${k}</i>${esc(v)}</span>`;
+const actText=(S,r)=>r.status==="quiet"?`⏳ no output for ${fmtD(S.now-r.lastOutputAt)} · ${r.activity}`:r.activity;
+const issueTitle=(S,r)=>S.cycles.get(r.labels.cycle)?.plan?.issues.find(i=>i.id===r.labels.issue)?.title;
+function runTitle(S,r){
+  if(r.labels.phase==="plan")return `Planner · cycle ${r.labels.cycle}`;
+  if(r.labels.phase==="merge")return `Merger · cycle ${r.labels.cycle}`;
+  const t=issueTitle(S,r);return `${r.name} #${r.labels.issue}${t?" — "+t:""}`;
+}
+function pickDefault(S){const rs=[...S.runs.values()];return rs.filter(r=>ACTIVE.has(r.status)).at(-1)||rs.at(-1)||null;}
+function stats(S){
+  const rs=[...S.runs.values()];
+  return {active:rs.filter(r=>ACTIVE.has(r.status)).length,done:rs.filter(r=>r.status==="done").length,cycle:[...S.cycles.keys()].at(-1)??"—"};
+}
+const logLines=(r,limit)=>(limit?r.log.slice(-limit):r.log).map(l=>`<div class="ln k-${l.kind}"><span class="ts">${fmtT(l.t)}</span><span class="tx">${esc(l.text)}</span></div>`).join("")
+  +(ACTIVE.has(r.status)?`<div class="ln"><span class="ts"></span><span class="cursor">▍</span></div>`:"");
+
+const detailTabs=r=>[["log","Log",r.log.length],["iterations","Iterations",r.iterations.length],["commits","Commits",r.commits.length],["events","Events",r.events.length]];
+function runDetail(S,r,{closable}={}){
+  if(!r)return `<div class="rd empty">Select an agent to inspect it.</div>`;
+  const tabs=detailTabs(r), body=detailBody(S,r);
+  return `<div class="rd">
+    <div class="rd-head">
+      <div class="rd-title">${dot(r.status)}<b>${esc(runTitle(S,r))}</b>${pill(r.status)}${closable?`<button class="x" data-act="close" title="Close (Esc)">✕</button>`:""}</div>
+      <div class="rd-meta">${runMeta(S,r)}</div>
+      ${runAlerts(S,r)}
+    </div>
+    <div class="rd-tabs">${tabs.map(([k,l,n])=>`<div class="rd-tab${ui.tab===k?" on":""}" data-act="tab:${k}">${l} <span class="n">${n}</span></div>`).join("")}</div>
+    <div class="rd-body" data-sk="rd-${r.runId}-${ui.tab}" data-stick>${body}</div>
+  </div>`;
+}
+const runMeta=(S,r)=>`${kv("agent",`${r.agent} · ${short(r.model)}`)}${kv("branch",r.branch)}${kv("sandbox",`${r.sandbox}${r.container?" · "+r.container:""}`)}${kv("cycle",r.labels.cycle)}
+  ${kv("started",fmtT(r.startedAt))}${kv("duration",fmtD(dur(S,r)))}${kv("iteration",`${r.iteration} / ${r.maxIterations}`)}${kv("tokens",r.tin?`${fmtK(r.tin)} in · ${fmtK(r.tout)} out`:"— (reported when an iteration ends)")}${kv("commits",r.commits.length)}`;
+const runAlerts=(S,r)=>`${r.status==="quiet"?`<div class="warn">No output for ${fmtD(S.now-r.lastOutputAt)} — idle timeout fires at ${IDLE_TIMEOUT}s</div>`:""}${r.error?`<div class="errbox">${esc(r.error)}</div>`:""}`;
+function detailBody(S,r){
+  let body;
+  if(ui.tab==="iterations")body=r.iterations.length?`<table class="it"><tr><th>#</th><th>start</th><th>duration</th><th>input</th><th>cache read</th><th>cache write</th><th>output</th><th>session</th></tr>${
+    r.iterations.map(it=>`<tr><td>${it.n}</td><td>${fmtT(it.start)}</td><td>${fmtD((it.end??S.now)-it.start)}${it.end?"":" …"}</td><td>${it.usage?fmtK(it.usage.inputTokens):"—"}</td><td>${it.usage?fmtK(it.usage.cacheReadInputTokens):"—"}</td><td>${it.usage?fmtK(it.usage.cacheCreationInputTokens):"—"}</td><td>${it.usage?fmtK(it.usage.outputTokens):"—"}</td><td class="mono">${it.sessionId?it.sessionId.slice(0,8):"—"}</td></tr>`).join("")}</table>`:`<div class="none">No iterations yet.</div>`;
+  else if(ui.tab==="commits")body=r.commits.length?r.commits.map(c=>`<div class="cmt"><span class="mono">${c.sha}</span><span>${esc(c.message)}</span><span>iter ${c.iteration} · ${fmtT(c.t)}</span></div>`).join(""):`<div class="none">No commits yet.</div>`;
+  else if(ui.tab==="events")body=`<pre class="nd">${r.events.map(e=>esc(JSON.stringify(toWire(e)))).join("\n")}</pre>`;
+  else body=logLines(r);
+  return body;
+}
+
+// Terminal-pane detail (from variant D), used by variant E.
+function paneDetail(S,r){
+  if(!r)return `<div class="pane st-none"><div class="pane-h"><span>select a node or a timeline row</span></div><div class="pane-b"></div></div>`;
+  const name=r.labels.issue?`${r.name} #${r.labels.issue}`:`${r.name} · cycle ${r.labels.cycle}`;
+  return `<div class="pane st-${r.status}">
+    <div class="pane-h">${dot(r.status)}<b>${esc(name)}</b><span class="pill st-${r.status}">${LABEL[r.status]}</span>
+      <span>${short(r.model)} · iter ${r.iteration}/${r.maxIterations} · ${esc(r.branch)}${r.container?" · "+r.container:""}</span><span class="grow"></span>
+      ${r.status==="quiet"?`<span class="q">no output ${fmtD(S.now-r.lastOutputAt)} / ${IDLE_TIMEOUT}s</span>`:""}
+      <span>${r.tin?`${fmtK(r.tin)} in · ${fmtK(r.tout)} out · `:""}${r.commits.length} commit${r.commits.length===1?"":"s"} · ${fmtD(dur(S,r))}</span></div>
+    <div class="pane-tabs">${detailTabs(r).map(([k,l,n])=>`<span class="pt${ui.tab===k?" on":""}" data-act="tab:${k}">${l}<i>${n}</i></span>`).join("")}
+      ${r.error?`<span class="perr">✕ ${esc(r.error)}</span>`:""}</div>
+    <div class="pane-b" data-sk="pane-${r.runId}-${ui.tab}" data-stick>${detailBody(S,r)}</div>
+  </div>`;
+}
+
+// =====================================================================
+// Variant E — Combined: pipeline graph + timeline tab, terminal-pane detail, dark mode
+// =====================================================================
+function vE(S){
+  const st=stats(S), sel=S.runs.get(ui.selected)||pickDefault(S);
+  const tab=(k,l)=>`<button class="e-tab${ui.etab===k?" on":""}" data-act="etab:${k}">${l}</button>`;
+  return `<div class="vE">
+    <header class="e-top">
+      <span class="t">Sandcastle</span><span class="e-tmpl">${esc(S.session?.template??"")} · ${S.session?.sessionId??""}</span>
+      <nav class="e-tabs">${tab("graph","Pipeline")}${tab("timeline","Timeline")}</nav>
+      <span class="e-stats"><span>cycle <b>${st.cycle}</b></span><span><b>${st.active}</b> active</span><span><b>${S.tot.commits}</b> commits</span>
+        <span><b>${fmtK(S.tot.tin+S.tot.tout)}</b> tokens</span><span class="${S.tot.failed?"bad":""}"><b>${S.tot.failed}</b> failed</span><span><b>${fmtT(S.now)}</b></span>
+        ${S.finished?`<span class="ok">✓ finished</span>`:""}</span>
+      ${ui.etab==="timeline"?ganttLegend():""}
+      <button class="e-theme" data-act="dark" title="Toggle dark mode (d)">${ui.dark?"☀ Light":"☾ Dark"}</button>
+    </header>
+    ${ui.etab==="timeline"
+      ?`<div class="gantt e-main" data-sk="e-gantt">${ganttHtml(S,sel)}</div>`
+      :`<div class="b-graph e-main" data-sk="e-graph" data-stick>${graphCanvas(S,sel)}</div>`}
+    <div class="e-detail">${paneDetail(S,sel)}</div>
+  </div>`;
+}
+
+// =====================================================================
+// Variant A — Factory floor
+// =====================================================================
+function vA(S){
+  const P=pipeline(S), st=stats(S), sel=S.runs.get(ui.selected);
+  const tiles=[["Elapsed",fmtT(S.now)],["Cycle",st.cycle],["Active",st.active],["Iterations",S.tot.iterations],["Tool calls",S.tot.tools],["Commits",S.tot.commits],["Tokens in/out",`${fmtK(S.tot.tin)} / ${fmtK(S.tot.tout)}`],["Failed",S.tot.failed]];
+  const card=(r,title)=>{
+    const pips=r.iterations.map(it=>`<i class="${it.end?"f":"c"}"></i>`).join("");
+    return `<div class="card st-${r.status}${ui.selected===r.runId?" sel":""}" data-act="select:${r.runId}">
+      <div class="card-top">${dot(r.status)}<span class="card-name">${esc(title)}</span>${pill(r.status)}</div>
+      <div class="card-meta">${short(r.model)} · ${fmtD(dur(S,r))}${r.commits.length?` · ${r.commits.length} commit${r.commits.length>1?"s":""}`:""} · ${tok(r.tin+r.tout)} tok</div>
+      <div class="card-act mono">${esc(actText(S,r))}</div>
+      ${r.maxIterations>1?`<div class="pips">${pips}<span>iter ${r.iteration}</span></div>`:""}
+    </div>`;
+  };
+  const ph=(title,state,why)=>`<div class="card ph st-${state}"><div class="card-top">${dot(state)}<span class="card-name">${esc(title)}</span>${pill(state)}</div><div class="card-meta">${esc(why)}</div></div>`;
+  const cardsFor=(c,k)=>{
+    if(k==="plan")return c.planner?[card(c.planner,c.plan?`Planner → ${c.plan.issues.length} issue(s)`:"Planner")]:[];
+    if(k==="implement")return c.lanes.map(l=>l.impl?card(l.impl,`#${l.issue.id} ${l.issue.title}`):ph(`#${l.issue.id} ${l.issue.title}`,"queued","Waiting for a sandbox"));
+    if(k==="review")return c.lanes.map(l=>l.rev?card(l.rev,`#${l.issue.id} review`):ph(`#${l.issue.id} review`,l.revPh,
+      l.revPh==="waiting"?"Waits for implementer":l.revPh==="queued"?"Starting…":l.impl?.status==="failed"?"Implementer failed":"No commits to review"));
+    if(c.merger)return [card(c.merger,`Merge ${c.merger.labels.branches} branch(es)`)];
+    if(c.mergePh==="none"||!c.plan)return [];
+    const pending=c.lanes.filter(l=>(l.impl?ACTIVE.has(l.impl.status):true)||(l.rev&&ACTIVE.has(l.rev.status))||l.revPh==="waiting"||l.revPh==="queued").length;
+    return [ph("Merger",c.mergePh,c.mergePh==="waiting"?`Waits for ${pending} pipeline(s)`:"Starting…")];
+  };
+  const cols=[["plan","Plan"],["implement","Implement"],["review","Review"],["merge","Merge"]].map(([k,l])=>{
+    const groups=[...P].reverse().map(c=>{const cs=cardsFor(c,k);return cs.length?`<div class="cg${c.n!==st.cycle?" old":""}"><div class="cg-h">Cycle ${c.n}</div>${cs.join("")}</div>`:"";}).join("");
+    const n=[...S.runs.values()].filter(r=>r.labels.phase===k&&ACTIVE.has(r.status)).length;
+    return `<section class="col"><header><b>${l}</b><span>${n} active</span></header><div class="col-body" data-sk="col-${k}">${groups||`<div class="col-empty">—</div>`}</div></section>`;
+  }).join("");
+  return `<div class="vA">
+    <header class="a-top">
+      <div><div class="a-title">Sandcastle <span>·</span> ${esc(S.session?.template??"")}</div>
+      <div class="a-sub">${S.session?.sessionId??""} · ${S.session?.cwd??""} · ${S.finished?`<b class="fin">finished — ${esc(S.finished.reason)}</b>`:"running"}</div></div>
+      <div class="tiles">${tiles.map(([k,v])=>`<div class="tile"><i>${k}</i><b>${v}</b></div>`).join("")}</div>
+    </header>
+    <main class="board">${cols}</main>
+    ${sel?`<aside class="drawer">${runDetail(S,sel,{closable:true})}</aside>`:""}
+  </div>`;
+}
+
+// =====================================================================
+// Variant B — Pipeline graph
+// =====================================================================
+function graphCanvas(S,sel){
+  const P=pipeline(S);
+  const W=200,H=74,X=[30,290,550,810],RG=92;
+  const nodes=[],edges=[],bands=[];let y=10,prevMerge=null,lastPlanner=null;
+  for(const c of P){
+    const rows=Math.max(1,c.lanes.length), top=y+34, mid=top+(rows-1)*RG/2;
+    bands.push({n:c.n,y});
+    const pl={x:X[0],y:mid,r:c.planner,title:`Planner`,sub:c.plan?`${c.plan.issues.length} unblocked issue(s)`:"Reading backlog…"};
+    nodes.push(pl);lastPlanner=pl;
+    if(prevMerge)edges.push({from:prevMerge,to:pl,loop:true});
+    const toMerge=[];
+    c.lanes.forEach((l,i)=>{
+      const yy=top+i*RG;
+      const im={x:X[1],y:yy,r:l.impl,ph:l.implPh,title:`#${l.issue.id} implement`,sub:l.issue.title};
+      const rv={x:X[2],y:yy,r:l.rev,ph:l.revPh,title:`#${l.issue.id} review`,sub:l.rev?l.issue.title:l.revPh==="skipped"?(l.impl?.status==="failed"?"implementer failed":"nothing to review"):""};
+      nodes.push(im,rv);edges.push({from:pl,to:im},{from:im,to:rv});toMerge.push(rv);
+    });
+    if(c.lanes.length){
+      const mg={x:X[3],y:mid,r:c.merger,ph:c.mergePh,title:"Merger",sub:c.merger?`${c.merger.labels.branches} branch(es) → main`:""};
+      nodes.push(mg);toMerge.forEach(rv=>edges.push({from:rv,to:mg}));prevMerge=mg;
+    }
+    y=top+rows*RG+24;
+  }
+  if(S.finished&&lastPlanner){const fin={x:X[1],y:lastPlanner.y,fin:true,title:"Session complete",sub:S.finished.reason};nodes.push(fin);edges.push({from:lastPlanner,to:fin});}
+  const stOf=n=>n.fin?"done":(n.r?.status??n.ph);
+  const cls=(a,b)=>{const fs=stOf(a),ts=stOf(b);
+    if(b.fin)return "done";if(fs==="failed")return "fail";if(fs==="skipped"||ts==="skipped")return "skip";
+    if(ACTIVE.has(ts))return "flow";if(ts==="done"||ts==="failed")return "done";return "idle";};
+  const paths=edges.map(e=>{
+    if(e.loop){const x1=e.from.x+W/2,y1=e.from.y+H,x2=e.to.x+W/2,y2=e.to.y;
+      return `<path class="e loop ${cls(e.from,e.to)}" d="M${x1} ${y1} C${x1} ${y1+50},${x2} ${y2-50},${x2} ${y2}"/>`;}
+    const x1=e.from.x+W,y1=e.from.y+H/2,x2=e.to.x,y2=e.to.y+H/2;
+    return `<path class="e ${cls(e.from,e.to)}" d="M${x1} ${y1} C${x1+40} ${y1},${x2-40} ${y2},${x2} ${y2}"/>`;
+  }).join("");
+  const nodeHtml=nodes.map(n=>{const s=stOf(n);
+    return `<div class="node st-${s}${n.r?"":" ghost"}${n.r&&sel?.runId===n.r.runId?" sel":""}" style="left:${n.x}px;top:${n.y}px;width:${W}px;height:${H}px"${n.r?` data-act="select:${n.r.runId}"`:""}>
+      <div class="nd-top">${dot(s)}<b>${esc(n.title)}</b><span class="nd-st">${LABEL[s]||""}</span></div>
+      <div class="nd-sub">${esc(n.sub||"")}</div>
+      <div class="nd-act mono">${n.r?esc(actText(S,n.r)):""}</div></div>`;}).join("");
+  const width=X[3]+W+40;
+  return `<div class="canvas" style="width:${width}px;height:${y+20}px">
+      ${bands.map(b=>`<div class="band" style="top:${b.y}px"><span>Cycle ${b.n}</span></div>`).join("")}
+      <svg width="${width}" height="${y+20}">${paths}</svg>${nodeHtml}
+    </div>`;
+}
+function vB(S){
+  const st=stats(S), sel=S.runs.get(ui.selected)||pickDefault(S);
+  return `<div class="vB">
+    <div class="b-top"><span class="t">Sandcastle pipeline</span><span>${S.session?.sessionId??""}</span>
+      <span>cycle <b>${st.cycle}</b></span><span><b>${st.active}</b> active</span><span><b>${S.tot.commits}</b> commits</span>
+      <span><b>${fmtK(S.tot.tin+S.tot.tout)}</b> tokens</span><span><b>${S.tot.failed}</b> failed</span><span>elapsed <b>${fmtT(S.now)}</b></span>
+      ${S.finished?`<span style="color:#15803d"><b style="color:inherit">✓ ${esc(S.finished.reason)}</b></span>`:""}</div>
+    <div class="b-graph" data-sk="graph" data-stick>${graphCanvas(S,sel)}</div>
+    <div class="b-detail">${runDetail(S,sel)}</div>
+  </div>`;
+}
+
+// =====================================================================
+// Variant C — Timeline (Gantt)
+// =====================================================================
+const GANTT_LEGEND=[["sg-provision","provisioning"],["sg-setup","hooks / setup"],["sg-iter","iteration"],["sg-idle","idle → timeout"],["cm-key","commit"]];
+const ganttLegend=()=>`<div class="legend">${GANTT_LEGEND.map(([c,l])=>`<span><i class="${c}"></i>${l}</span>`).join("")}</div>`;
+function ganttHtml(S,sel){
+  const P=pipeline(S);
+  const T=Math.max(S.now,90)*1.06, pct=t=>`${(t/T*100).toFixed(3)}%`;
+  const step=[15,30,60,120,300,600,1200].find(s=>T/s<=10)||1200;
+  let axis="";for(let x=0;x<=T;x+=step)axis+=`<span style="left:${pct(x)}">${fmtT(x)}</span>`;
+  const playhead=`<div class="phd" style="left:${pct(S.now)}"></div>`;
+  const row=(r,label,sub,ph)=>{
+    if(!r)return `<div class="g-row ghost"><div class="g-lab">${dot(ph)}<span>${esc(label)}</span><small>${esc(sub)}</small></div><div class="g-track"><span class="ph-lab" style="left:${pct(S.now)}">${LABEL[ph]}</span>${playhead}</div></div>`;
+    const segs=r.segs.map(s=>{const e=s.end??S.now;
+      return `<div class="seg sg-${s.kind}${s.kind==="iter"&&s.n%2===0?" alt":""}" style="left:${pct(s.start)};width:max(2px,${pct(e-s.start)})" title="${s.kind==="iter"?"iteration "+s.n:s.kind} · ${fmtD(e-s.start)}"></div>`;}).join("");
+    const ticks=r.ticks.map(t=>`<i class="tick" style="left:${pct(t)}"></i>`).join("");
+    const cms=r.commits.map(c=>`<i class="cm" style="left:${pct(c.t)}" title="${c.sha} ${esc(c.message)}"></i>`).join("");
+    const endm=r.endedAt?`<span class="endm" style="left:${pct(r.endedAt)};color:${r.status==="failed"?"#dc2626":"#16a34a"}">${r.status==="failed"?"✕":"✓"}</span>`:"";
+    return `<div class="g-row${sel?.runId===r.runId?" sel":""}" data-act="select:${r.runId}"><div class="g-lab">${dot(r.status)}<span>${esc(label)}</span><small>${esc(sub)}</small></div><div class="g-track">${segs}${ticks}${cms}${endm}${playhead}</div></div>`;
+  };
+  let rows="";
+  for(const c of P){
+    rows+=`<div class="g-row hdr"><div class="g-lab">Cycle ${c.n}</div><div></div></div>`;
+    if(c.planner)rows+=row(c.planner,"planner",short(c.planner.model));
+    for(const l of c.lanes){
+      rows+=row(l.impl,`implementer #${l.issue.id}`,l.issue.title,l.implPh);
+      if(l.rev||l.revPh!=="skipped")rows+=row(l.rev,`reviewer #${l.issue.id}`,l.issue.title,l.revPh);
+    }
+    if(c.merger||c.mergePh!=="none"&&c.plan)rows+=row(c.merger,"merger",c.merger?`${c.merger.labels.branches} branch(es)`:"",c.mergePh);
+  }
+  return `<div class="g-axis"><div class="g-lab">click the axis to scrub</div><div class="g-scale" data-act="seek" data-t="${T}">${axis}<span class="ph-cap" style="left:${pct(S.now)}">${fmtT(S.now)}</span></div></div>
+    ${rows}`;
+}
+function vC(S){
+  const st=stats(S), sel=S.runs.get(ui.selected)||pickDefault(S);
+  return `<div class="vC">
+    <div class="c-top"><span class="t">Session timeline</span><span>${S.session?.sessionId??""}</span><span>cycle <b>${st.cycle}</b></span>
+      <span><b>${st.active}</b> active</span><span><b>${S.tot.iterations}</b> iterations</span><span><b>${S.tot.commits}</b> commits</span>
+      ${ganttLegend()}</div>
+    <div class="gantt" data-sk="gantt">${ganttHtml(S,sel)}</div>
+    <div class="c-detail">${runDetail(S,sel)}</div>
+  </div>`;
+}
+
+// =====================================================================
+// Variant D — Terminal wall
+// =====================================================================
+function vD(S){
+  const P=pipeline(S), st=stats(S), runs=[...S.runs.values()];
+  const max=ui.maximized&&S.runs.get(ui.maximized);
+  const onWall=runs.filter(r=>ACTIVE.has(r.status)||(r.endedAt&&S.now-r.endedAt<6));
+  const tree=P.map(c=>{
+    const item=(r,label,ph)=>r?`<div class="tr st-${r.status}${max&&max.runId===r.runId?" sel":""}" data-act="max:${r.runId}">${dot(r.status)}<b>${esc(label)}</b><span>${LABEL[r.status]}</span></div>`
+      :`<div class="tr ph st-${ph}">${dot(ph)}<b>${esc(label)}</b><span>${LABEL[ph]}</span></div>`;
+    let h=`<div class="d-cy">cycle ${c.n}</div>`;
+    if(c.planner)h+=item(c.planner,"planner");
+    for(const l of c.lanes){h+=item(l.impl,`impl  #${l.issue.id}`,l.implPh);h+=item(l.rev,`review #${l.issue.id}`,l.revPh);}
+    if(c.lanes.length)h+=item(c.merger,"merger",c.mergePh);
+    return h;
+  }).join("");
+  let main;
+  if(max)main=`<div class="d-max"><div class="d-max-bar"><button data-act="unmax">⤡ back to wall (Esc)</button></div>${runDetail(S,max)}</div>`;
+  else if(onWall.length){
+    const cols=onWall.length<=1?1:onWall.length<=4?2:3;
+    main=`<div class="d-main" style="grid-template-columns:repeat(${cols},minmax(0,1fr))">${onWall.map(r=>`
+      <div class="pane st-${r.status}">
+        <div class="pane-h" data-act="max:${r.runId}">${dot(r.status)}<b>${esc(r.labels.issue?`${r.name} #${r.labels.issue}`:`${r.name} c${r.labels.cycle}`)}</b>
+          <span>${short(r.model)} · iter ${r.iteration} · ${esc(r.branch)}</span><span class="grow"></span>
+          ${r.status==="quiet"?`<span class="q">no output ${fmtD(S.now-r.lastOutputAt)}</span>`:""}<span>${fmtD(dur(S,r))} ⤢</span></div>
+        <div class="pane-b" data-sk="pane-${r.runId}" data-stick>${logLines(r,120)}</div>
+      </div>`).join("")}</div>`;
+  } else main=`<div class="d-idle">${S.finished?`session finished<br>${esc(S.finished.reason)}<br><br>${S.tot.commits} commits · ${S.tot.iterations} iterations · ${fmtK(S.tot.tin+S.tot.tout)} tokens`:"waiting for the next agent…"}</div>`;
+  const dock=runs.filter(r=>!ACTIVE.has(r.status)).map(r=>`<div class="chip st-${r.status}" data-act="max:${r.runId}">${dot(r.status)}${esc(r.labels.issue?`${r.name} #${r.labels.issue}`:`${r.name} c${r.labels.cycle}`)}<span>${fmtD(dur(S,r))}</span></div>`).join("");
+  return `<div class="vD">
+    <div class="d-status"><span>[sandcastle]</span><span>${S.session?.sessionId??""}</span><span>cycle ${st.cycle}</span><span>● ${st.active} active</span>
+      <span>✓ ${st.done} done</span><span>✕ ${S.tot.failed}</span><span>${S.tot.commits} commits</span><span class="grow"></span><span>${fmtT(S.now)}</span></div>
+    <nav class="d-side">${tree}</nav>
+    ${main}
+    <div class="d-dock">${dock||`<span style="color:var(--muted);font-size:11.5px">finished runs land here</span>`}</div>
+  </div>`;
+}
+
+// =====================================================================
+// Prototype harness: variant switcher, replay controls, raw event panel
+// =====================================================================
+const VARIANTS=[["A","Factory floor",vA],["B","Pipeline graph",vB],["C","Timeline",vC],["D","Terminal wall",vD],["E","Combined",vE]];
+const params=new URLSearchParams(location.search);
+const ui={v:Math.max(0,VARIANTS.findIndex(x=>x[0]===(params.get("variant")||"E").toUpperCase())),
+  playing:true,speed:15,now:0,selected:null,tab:"log",maximized:null,raw:false,
+  etab:"graph",dark:matchMedia("(prefers-color-scheme: dark)").matches};
+const $=id=>document.getElementById(id), root=$("root"), raw=$("raw"), sc=$("sc");
+sc.max=END;
+let dirty=true,lastRender=0,lastTs=0;
+
+function setVariant(i){
+  ui.v=(i+VARIANTS.length)%VARIANTS.length;
+  const p=new URLSearchParams(location.search);p.set("variant",VARIANTS[ui.v][0]);
+  try{history.replaceState(null,"","?"+p);}catch{}
+  dirty=true;
+}
+function togglePlay(){if(!ui.playing&&ui.now>=END)ui.now=0;ui.playing=!ui.playing;dirty=true;}
+
+function render(){
+  dirty=false;lastRender=performance.now();
+  const S=fold(ui.now);
+  const saved={};
+  root.querySelectorAll("[data-sk]").forEach(el=>saved[el.dataset.sk]={top:el.scrollTop,bottom:el.scrollHeight-el.scrollTop-el.clientHeight<12});
+  const key=VARIANTS[ui.v][0];
+  root.className=key==="D"||(key==="E"&&ui.dark)?"dark":"";
+  root.innerHTML=VARIANTS[ui.v][2](S);
+  root.querySelectorAll("[data-sk]").forEach(el=>{
+    const s=saved[el.dataset.sk], stick=el.hasAttribute("data-stick");
+    if(s&&!(stick&&s.bottom))el.scrollTop=s.top;else if(stick)el.scrollTop=el.scrollHeight;
+  });
+  $("vl").textContent=`${VARIANTS[ui.v][0]} (${VARIANTS[ui.v][1]})`;
+  $("pp").textContent=ui.playing?"⏸":"▶";
+  if(document.activeElement!==sc)sc.value=ui.now;
+  $("tl").textContent=`${fmtT(ui.now)} / ${fmtT(END)}`;
+  $("ev").classList.toggle("on",ui.raw);
+  raw.hidden=!ui.raw;
+  if(ui.raw){
+    raw.innerHTML=`<div class="raw-h">RunEvent stream · .sandcastle/events/${S.session?.sessionId??"…"}.ndjson · ${S.events.length} / ${EVENTS.length} events</div><pre>${S.events.slice(-80).map(e=>esc(JSON.stringify(toWire(e)))).join("\n")}</pre>`;
+    const pre=raw.querySelector("pre");pre.scrollTop=pre.scrollHeight;
+  }
+}
+function frame(ts){
+  const dt=lastTs?(ts-lastTs)/1000:0;lastTs=ts;
+  if(ui.playing){ui.now=Math.min(END,ui.now+dt*ui.speed);if(ui.now>=END){ui.playing=false;dirty=true;}}
+  if(dirty||(ui.playing&&ts-lastRender>200))render();
+  requestAnimationFrame(frame);
+}
+
+root.addEventListener("click",e=>{
+  const el=e.target.closest("[data-act]");if(!el)return;
+  const [a,arg]=el.dataset.act.split(/:(.*)/s);
+  if(a==="select")ui.selected=arg;
+  else if(a==="tab")ui.tab=arg;
+  else if(a==="close")ui.selected=null;
+  else if(a==="max")ui.maximized=arg;
+  else if(a==="unmax")ui.maximized=null;
+  else if(a==="etab")ui.etab=arg;
+  else if(a==="dark")ui.dark=!ui.dark;
+  else if(a==="seek"){const b=el.getBoundingClientRect();ui.now=Math.max(0,Math.min(END,(e.clientX-b.left)/b.width*+el.dataset.t));}
+  dirty=true;
+});
+$("pv").onclick=()=>setVariant(ui.v-1);
+$("nx").onclick=()=>setVariant(ui.v+1);
+$("pp").onclick=togglePlay;
+$("rs").onclick=()=>{ui.now=0;ui.playing=true;dirty=true;};
+$("end").onclick=()=>{ui.now=END;ui.playing=false;dirty=true;};
+$("ev").onclick=()=>{ui.raw=!ui.raw;dirty=true;};
+$("sp").onchange=e=>{ui.speed=+e.target.value;e.target.blur();};
+sc.oninput=()=>{ui.now=+sc.value;dirty=true;};
+sc.onchange=()=>sc.blur();
+addEventListener("keydown",e=>{
+  if(e.target.closest("input,textarea,select,[contenteditable]"))return;
+  if(e.key==="ArrowLeft")setVariant(ui.v-1);
+  else if(e.key==="ArrowRight")setVariant(ui.v+1);
+  else if(e.key===" "){e.preventDefault();togglePlay();}
+  else if(e.key==="Escape"){ui.selected=null;ui.maximized=null;dirty=true;}
+  else if(e.key==="d"&&VARIANTS[ui.v][0]==="E"){ui.dark=!ui.dark;dirty=true;}
+  else if(e.key==="t"&&VARIANTS[ui.v][0]==="E"){ui.etab=ui.etab==="graph"?"timeline":"graph";dirty=true;}
+});
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
