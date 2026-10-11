@@ -14,6 +14,13 @@ import { mergeProviderEnv } from "./mergeProviderEnv.js";
 import { orchestrate, type IterationResult } from "./Orchestrator.js";
 import { agentStreamEmitterLayer } from "./AgentStreamEmitter.js";
 import {
+  createRunEventEmitter,
+  describeRunError,
+  RunEvents,
+  type RunEventLabels,
+  type RunEventsOption,
+} from "./RunEvents.js";
+import {
   type PromptArgs,
   substitutePromptArgs,
   validateNoArgsWithInlinePrompt,
@@ -130,6 +137,10 @@ export interface ResumeSandboxRunResultOptions {
    *   with a fresh signal, or `.close()` to tear down.
    */
   readonly signal?: AbortSignal;
+  /** Tags carried on this run's `runStarted` event. See `RunOptions.labels`. */
+  readonly labels?: RunEventLabels;
+  /** Where structured run events go. See `RunOptions.events`. */
+  readonly events?: RunEventsOption;
 }
 
 export interface SandboxRunOptions extends ResumeSandboxRunResultOptions {
@@ -284,6 +295,8 @@ interface SandboxHandleContext {
   readonly bindMountHandle: BindMountSandboxHandle | undefined;
   /** Provider tag, used by resumeSession to dispatch the host-side session lookup. */
   readonly providerTag: SandboxProvider["tag"];
+  /** Provider name, surfaced on run events. */
+  readonly providerName: string;
   readonly applyToHost: () => Effect.Effect<void, any>;
   readonly timeouts?: Timeouts;
   /** Worktree branch strategy. Set only when the handle is backed by a
@@ -426,22 +439,45 @@ const buildSandboxHandle = (
             })()
           : silentDisplayLayer;
 
+      const runEvents = createRunEventEmitter({
+        hostRepoDir,
+        events: runOptions.events,
+      });
+
       const reuseFactoryLayer = Layer.succeed(SandboxFactory, {
         withSandbox: (makeEffect) =>
-          makeEffect(
-            {
-              hostWorktreePath: worktreePath,
-              sandboxRepoPath: sandboxRepoDir,
-              applyToHost,
-              bindMountHandle,
-            },
-            sandbox,
-          ).pipe(
-            Effect.map((value) => ({
-              value,
-              preservedWorktreePath: undefined,
-            })),
-          ) as any,
+          Effect.sync(() => {
+            runEvents.emit({
+              type: "worktreeReady",
+              path: worktreePath,
+              branch,
+              reused: true,
+            });
+            runEvents.emit({
+              type: "sandboxReady",
+              provider: ctx.providerName,
+              reused: true,
+            });
+          })
+            .pipe(
+              Effect.andThen(
+                makeEffect(
+                  {
+                    hostWorktreePath: worktreePath,
+                    sandboxRepoPath: sandboxRepoDir,
+                    applyToHost,
+                    bindMountHandle,
+                  },
+                  sandbox,
+                ),
+              ),
+            )
+            .pipe(
+              Effect.map((value) => ({
+                value,
+                preservedWorktreePath: undefined,
+              })),
+            ) as any,
       });
 
       const streamEmitterLayer = agentStreamEmitterLayer(
@@ -452,7 +488,21 @@ const buildSandboxHandle = (
         reuseFactoryLayer,
         runDisplayLayer,
         streamEmitterLayer,
+        Layer.succeed(RunEvents, runEvents),
       );
+
+      runEvents.emit({
+        type: "runStarted",
+        name: runOptions.name,
+        labels: runOptions.labels ?? {},
+        agent: provider.name,
+        model: provider.model,
+        sandbox: ctx.providerName,
+        branchStrategy: branchStrategy?.type ?? "branch",
+        branch,
+        maxIterations,
+        hostRepoDir,
+      });
 
       let result;
       try {
@@ -495,10 +545,23 @@ const buildSandboxHandle = (
           }).pipe(Effect.provide(runLayer)),
         );
       } catch (error: unknown) {
+        runEvents.emit({
+          type: "runFailed",
+          ...describeRunError(error, runOptions.signal),
+        });
         // If the signal was aborted, surface its reason verbatim
         runOptions.signal?.throwIfAborted();
         throw error;
       }
+
+      runEvents.emit({
+        type: "runFinished",
+        iterations: result.iterations.length,
+        commits: result.commits.length,
+        branch: result.branch,
+        completionSignal: result.completionSignal,
+        preservedWorktreePath: result.preservedWorktreePath,
+      });
 
       const baseResult: SandboxRunResult = {
         iterations: result.iterations,
@@ -883,6 +946,7 @@ export const createSandboxFromWorktree = async (
       providerHandle,
       bindMountHandle,
       providerTag: options.sandbox.tag,
+      providerName: options.sandbox.name,
       applyToHost,
       timeouts: options.timeouts,
       branchStrategy: options.branchStrategy,
@@ -1125,6 +1189,7 @@ export const createSandbox = async (
       providerHandle,
       bindMountHandle,
       providerTag: options.sandbox.tag,
+      providerName: options.sandbox.name,
       applyToHost,
       timeouts: options.timeouts,
     },

@@ -39,6 +39,13 @@ import {
 import type { LoggingOption } from "./run.js";
 import { orchestrate, type IterationResult } from "./Orchestrator.js";
 import { agentStreamEmitterLayer } from "./AgentStreamEmitter.js";
+import {
+  createRunEventEmitter,
+  describeRunError,
+  RunEvents,
+  type RunEventLabels,
+  type RunEventsOption,
+} from "./RunEvents.js";
 import { resolveEnv } from "./EnvResolver.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
 import { startSandbox } from "./startSandbox.js";
@@ -154,6 +161,10 @@ export interface WorktreeRunOptions {
    * - The `Worktree` handle remains usable for subsequent operations.
    */
   readonly signal?: AbortSignal;
+  /** Tags carried on this run's `runStarted` event. See `RunOptions.labels`. */
+  readonly labels?: RunEventLabels;
+  /** Where structured run events go. See `RunOptions.events`. */
+  readonly events?: RunEventsOption;
 }
 
 export interface WorktreeRunResult {
@@ -514,6 +525,29 @@ export const createWorktree = async (
       });
     }
 
+    const runEvents = createRunEventEmitter({
+      hostRepoDir,
+      events: opts.events,
+    });
+    runEvents.emit({
+      type: "runStarted",
+      name: opts.name,
+      labels: opts.labels ?? {},
+      agent: provider.name,
+      model: provider.model,
+      sandbox: sandboxProvider.name,
+      branchStrategy: options.branchStrategy?.type ?? "branch",
+      branch: worktreeInfo.branch,
+      maxIterations,
+      hostRepoDir,
+    });
+    runEvents.emit({
+      type: "worktreeReady",
+      path: worktreeInfo.path,
+      branch: worktreeInfo.branch,
+      reused: true,
+    });
+
     const inner = Effect.gen(function* () {
       // 1. Resolve prompt
       const resolved = yield* resolvePrompt({ prompt, promptFile });
@@ -720,14 +754,27 @@ export const createWorktree = async (
     });
 
     try {
-      return await Effect.runPromise(
+      const result = await Effect.runPromise(
         inner.pipe(
           Effect.provide(ClackDisplay.layer),
           Effect.provide(NodeContext.layer),
           Effect.provide(NodeFileSystem.layer),
+          Effect.provideService(RunEvents, runEvents),
         ),
       );
+      runEvents.emit({
+        type: "runFinished",
+        iterations: result.iterations.length,
+        commits: result.commits.length,
+        branch: result.branch,
+        completionSignal: result.completionSignal,
+      });
+      return result;
     } catch (error: unknown) {
+      runEvents.emit({
+        type: "runFailed",
+        ...describeRunError(error, opts.signal),
+      });
       // If the signal was aborted, surface its reason verbatim (no wrapping)
       opts.signal?.throwIfAborted();
       throw error;

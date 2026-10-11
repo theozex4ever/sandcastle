@@ -26,6 +26,7 @@ import {
   SANDBOX_REPO_DIR,
 } from "./SandboxFactory.js";
 import { syncIn } from "./syncIn.js";
+import { currentRunEvents } from "./RunEvents.js";
 import { normalizeMounts } from "./mountUtils.js";
 
 export interface StartSandboxBindMountOptions {
@@ -94,13 +95,29 @@ export const startSandbox = (
   | SyncInTimeoutError
   | CopyToWorktreeTimeoutError
 > => {
-  if (options.provider.tag === "bind-mount") {
-    return startBindMountSandbox(options as StartSandboxBindMountOptions);
-  }
-  if (options.provider.tag === "none") {
-    return startNoSandbox(options as StartSandboxNoSandboxOptions);
-  }
-  return startIsolatedSandbox(options as StartSandboxIsolatedOptions);
+  const start =
+    options.provider.tag === "bind-mount"
+      ? startBindMountSandbox(options as StartSandboxBindMountOptions)
+      : options.provider.tag === "none"
+        ? startNoSandbox(options as StartSandboxNoSandboxOptions)
+        : startIsolatedSandbox(options as StartSandboxIsolatedOptions);
+  const provider = options.provider.name;
+  return Effect.flatMap(currentRunEvents, (events) => {
+    const started = Date.now();
+    events.emit({ type: "sandboxStarting", provider });
+    return start.pipe(
+      Effect.tap(() =>
+        Effect.sync(() =>
+          events.emit({
+            type: "sandboxReady",
+            provider,
+            reused: false,
+            durationMs: Date.now() - started,
+          }),
+        ),
+      ),
+    );
+  });
 };
 
 const startNoSandbox = (

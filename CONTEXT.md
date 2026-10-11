@@ -212,6 +212,22 @@ _Avoid_: "log file" (too generic), "output file"
 The display mode where Sandcastle renders an interactive UI in the terminal with spinners and styled status messages.
 _Avoid_: "stdout mode", "interactive mode", "CLI mode" (ambiguous with the CLI itself)
 
+**Run event**:
+A structured record of one step in a run's lifecycle -- `runStarted`, `sandboxReady`, `hookFinished`, `iterationFinished`, `toolCall`, `commit`, `runFailed`, etc. -- stamped with `sessionId`, `runId`, `seq` and `ts`. Written as NDJSON to the **run event file** and/or forwarded via `events.onEvent`. Superset of **agent stream events**; intended for dashboards and tracing.
+_Avoid_: "log event", "telemetry event"
+
+**Run event file**:
+The NDJSON file at `.sandcastle/events/<sessionId>.ndjson` that collects the **run events** of every run made by one process.
+_Avoid_: "event log" (ambiguous with the **run log**)
+
+**Run session**:
+All runs made by one process (one script invocation), identified by a shared `sessionId` (overridable via `SANDCASTLE_SESSION_ID`). Distinct from an **agent session**.
+_Avoid_: "session" on its own (ambiguous with **agent session**)
+
+**Labels**:
+Free-form key/value tags passed to `run()` via `labels` and carried on `runStarted`, so observers can group runs (e.g. by phase or issue). Not interpreted by Sandcastle.
+_Avoid_: "tags", "metadata"
+
 **Agent stream event**:
 A single item in the **agent**'s output stream -- either a `text` chunk or a `toolCall` -- surfaced to the caller of `run()` so the stream can be forwarded to an external observability system. Available only in **log-to-file mode** via the `onAgentStreamEvent` callback on the `logging` option. Each event carries its `iteration` number and a `timestamp`.
 _Avoid_: "log event" (the log file contains more than just agent output), "display entry" (internal UI type)

@@ -72,6 +72,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
+    // Labels group this run's events on the dashboard (see README: Run events).
+    labels: { phase: "plan", cycle: iteration },
     // Opus for planning: dependency analysis benefits from deeper reasoning.
     agent: sandcastle.claudeCode("claude-opus-4-8"),
     promptFile: "./.sandcastle/plan-prompt.md",
@@ -114,6 +116,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         sandbox: docker(),
         branchStrategy: { type: "branch", branch: issue.branch },
         name: "implementer",
+        labels: { phase: "implement", cycle: iteration, issue: issue.id },
         // Give each agent plenty of room to implement and iterate on tests.
         maxIterations: 100,
         // Sonnet for execution: fast and capable enough for typical issue work.
@@ -186,6 +189,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     hooks,
     sandbox: docker(),
     name: "merger",
+    labels: { phase: "merge", cycle: iteration },
     maxIterations: 1,
     // Sonnet is sufficient for merge conflict resolution.
     agent: sandcastle.claudeCode("claude-sonnet-4-6"),

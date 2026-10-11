@@ -31,6 +31,13 @@ import {
   agentStreamEmitterLayer,
   type AgentStreamEvent,
 } from "./AgentStreamEmitter.js";
+import {
+  createRunEventEmitter,
+  describeRunError,
+  RunEvents,
+  type RunEventLabels,
+  type RunEventsOption,
+} from "./RunEvents.js";
 import type { SandboxHooks } from "./SandboxLifecycle.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
 import { generateTempBranchName, getCurrentBranch } from "./WorktreeManager.js";
@@ -424,6 +431,18 @@ export interface RunOptions<A extends AgentProvider = AgentProvider> {
    * See ADR 0010 for design rationale.
    */
   readonly output?: OutputDefinition;
+  /**
+   * Free-form tags carried on this run's `runStarted` event (e.g.
+   * `{ phase: "implement", issue: "42", cycle: 1 }`) so observers such as the
+   * dashboard can group runs. Not interpreted by Sandcastle.
+   */
+  readonly labels?: RunEventLabels;
+  /**
+   * Where structured run events go. Defaults to an NDJSON file at
+   * `.sandcastle/events/<sessionId>.ndjson`. Pass `false` to disable, or
+   * `{ onEvent }` to also receive each event in-process.
+   */
+  readonly events?: RunEventsOption;
 }
 
 export type { IterationResult, IterationUsage } from "./Orchestrator.js";
@@ -692,10 +711,16 @@ export async function run(
     buildAgentStreamHandler(resolvedLogging),
   );
 
+  const runEvents = createRunEventEmitter({
+    hostRepoDir,
+    events: options.events,
+  });
+
   const runLayer = Layer.mergeAll(
     factoryLayer,
     displayLayer,
     streamEmitterLayer,
+    Layer.succeed(RunEvents, runEvents),
   );
 
   const baseEffect = Effect.gen(function* () {
@@ -787,16 +812,43 @@ export async function run(
         )
       : baseEffect;
 
+  runEvents.emit({
+    type: "runStarted",
+    name: options.name,
+    labels: options.labels ?? {},
+    agent: agentName,
+    model: provider.model,
+    sandbox: options.sandbox.name,
+    branchStrategy: effectiveBranchType,
+    branch: resolvedBranch,
+    maxIterations,
+    hostRepoDir,
+  });
+
   let result: OrchestrateResult;
   try {
     result = await Effect.runPromise(
       withErrorLog.pipe(Effect.provide(runLayer)),
     );
   } catch (error: unknown) {
+    runEvents.emit({
+      type: "runFailed",
+      ...describeRunError(error, options.signal),
+    });
     // If the signal was aborted, surface its reason verbatim (no wrapping)
     options.signal?.throwIfAborted();
     throw error;
   }
+
+  const emitRunFinished = () =>
+    runEvents.emit({
+      type: "runFinished",
+      iterations: result.iterations.length,
+      commits: result.commits.length,
+      branch: result.branch,
+      completionSignal: result.completionSignal,
+      preservedWorktreePath: result.preservedWorktreePath,
+    });
 
   const baseResult = {
     ...result,
@@ -857,8 +909,15 @@ export async function run(
           sessionFilePath: lastIteration?.sessionFilePath,
         },
       );
+      runEvents.emit({
+        type: "structuredOutput",
+        tag: options.output.tag,
+        value: output,
+      });
+      emitRunFinished();
       return { ...baseResult, output };
     } catch (error) {
+      runEvents.emit({ type: "runFailed", ...describeRunError(error) });
       // Built-in retry: when maxRetries > 0 and the agent emitted a session id
       // we can resume, recurse with a token-efficient feedback prompt. Each
       // retry decrements maxRetries so the recursion terminates. See issue
@@ -890,5 +949,6 @@ export async function run(
     }
   }
 
+  emitRunFinished();
   return baseResult;
 }

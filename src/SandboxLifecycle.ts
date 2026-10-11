@@ -2,6 +2,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { Deferred, Duration, Effect, Schedule } from "effect";
 import { Display } from "./Display.js";
+import { observeHook } from "./RunEvents.js";
 import {
   CommitCollectionTimeoutError,
   ExecError,
@@ -115,26 +116,32 @@ export const runHostHooks = (
   }>,
   cwd: string,
   signal?: AbortSignal,
+  /** Lifecycle hook name, surfaced on run events. */
+  hookName: string = "onWorktreeReady",
 ): Effect.Effect<void, ExecError | HookTimeoutError> =>
   Effect.gen(function* () {
     for (const hook of hooks) {
       const timeout = hook.timeoutMs ?? HOOK_TIMEOUT_MS;
-      yield* Effect.tryPromise({
-        try: () => execAsync(hook.command, { cwd, signal }),
-        catch: (err) =>
-          new ExecError({
-            command: hook.command,
-            message: `Host hook failed: ${hook.command}\n${err instanceof Error ? err.message : String(err)}`,
-          }),
-      }).pipe(
-        withTimeout(
-          timeout,
-          () =>
-            new HookTimeoutError({
-              message: `Host hook '${hook.command}' timed out after ${timeout}ms`,
-              timeoutMs: timeout,
+      yield* observeHook(
+        { hook: hookName, where: "host" },
+        hook.command,
+        Effect.tryPromise({
+          try: () => execAsync(hook.command, { cwd, signal }),
+          catch: (err) =>
+            new ExecError({
               command: hook.command,
+              message: `Host hook failed: ${hook.command}\n${err instanceof Error ? err.message : String(err)}`,
             }),
+        }).pipe(
+          withTimeout(
+            timeout,
+            () =>
+              new HookTimeoutError({
+                message: `Host hook '${hook.command}' timed out after ${timeout}ms`,
+                timeoutMs: timeout,
+                command: hook.command,
+              }),
+          ),
         ),
       );
     }
@@ -308,51 +315,59 @@ export const withSandboxLifecycle = <A>(
 
         const sandboxHookEffects = (sandboxHooks ?? []).map((hook) => {
           const timeout = hook.timeoutMs ?? HOOK_TIMEOUT_MS;
-          return Effect.raceFirst(
-            execOk(sandbox, hook.command, {
-              cwd: sandboxRepoDir,
-              sudo: hook.sudo,
-            }).pipe(
-              withTimeout(
-                timeout,
-                () =>
-                  new HookTimeoutError({
-                    message: `Hook '${hook.command}' timed out after ${timeout}ms`,
-                    timeoutMs: timeout,
-                    command: hook.command,
-                  }),
+          return observeHook(
+            { hook: "onSandboxReady", where: "sandbox" },
+            hook.command,
+            Effect.raceFirst(
+              execOk(sandbox, hook.command, {
+                cwd: sandboxRepoDir,
+                sudo: hook.sudo,
+              }).pipe(
+                withTimeout(
+                  timeout,
+                  () =>
+                    new HookTimeoutError({
+                      message: `Hook '${hook.command}' timed out after ${timeout}ms`,
+                      timeoutMs: timeout,
+                      command: hook.command,
+                    }),
+                ),
               ),
+              Deferred.await(abortDeferred) as Effect.Effect<
+                never,
+                ExecError,
+                never
+              >,
             ),
-            Deferred.await(abortDeferred) as Effect.Effect<
-              never,
-              ExecError,
-              never
-            >,
           );
         });
 
         const hostHookEffects = (hostOnSandboxReady ?? []).map((hook) => {
           const timeout = hook.timeoutMs ?? HOOK_TIMEOUT_MS;
-          return Effect.tryPromise({
-            try: () =>
-              execAsync(hook.command, {
-                cwd: hostSideWorktreePath,
-                signal,
-              }),
-            catch: (err) =>
-              new ExecError({
-                command: hook.command,
-                message: `Host hook failed: ${hook.command}\n${err instanceof Error ? err.message : String(err)}`,
-              }),
-          }).pipe(
-            withTimeout(
-              timeout,
-              () =>
-                new HookTimeoutError({
-                  message: `Host hook '${hook.command}' timed out after ${timeout}ms`,
-                  timeoutMs: timeout,
-                  command: hook.command,
+          return observeHook(
+            { hook: "onSandboxReady", where: "host" },
+            hook.command,
+            Effect.tryPromise({
+              try: () =>
+                execAsync(hook.command, {
+                  cwd: hostSideWorktreePath,
+                  signal,
                 }),
+              catch: (err) =>
+                new ExecError({
+                  command: hook.command,
+                  message: `Host hook failed: ${hook.command}\n${err instanceof Error ? err.message : String(err)}`,
+                }),
+            }).pipe(
+              withTimeout(
+                timeout,
+                () =>
+                  new HookTimeoutError({
+                    message: `Host hook '${hook.command}' timed out after ${timeout}ms`,
+                    timeoutMs: timeout,
+                    command: hook.command,
+                  }),
+              ),
             ),
           );
         });
