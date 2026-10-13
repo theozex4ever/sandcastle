@@ -228,6 +228,14 @@ _Avoid_: "session" on its own (ambiguous with **agent session**)
 Free-form key/value tags passed to `run()` via `labels` and carried on `runStarted`, so observers can group runs (e.g. by phase or issue). Not interpreted by Sandcastle.
 _Avoid_: "tags", "metadata"
 
+**Dashboard**:
+The local web UI started by `sandcastle dashboard` that tails **run event files** and shows a **run session** as a factory floor: a station per `phase` **label**, a tile per run, a shared timeline and a per-run log.
+_Avoid_: "monitor", "UI" on its own
+
+**Lost run**:
+A run with no `runFinished` or `runFailed` event whose process (the `pid` on `runStarted`) is no longer alive, typically because the script crashed or was interrupted. Shown as `lost` on the **dashboard**.
+_Avoid_: "orphaned run", "zombie run", "stuck run" (a stuck run's process is still alive)
+
 **Agent stream event**:
 A single item in the **agent**'s output stream -- either a `text` chunk or a `toolCall` -- surfaced to the caller of `run()` so the stream can be forwarded to an external observability system. Available only in **log-to-file mode** via the `onAgentStreamEvent` callback on the `logging` option. Each event carries its `iteration` number and a `timestamp`.
 _Avoid_: "log event" (the log file contains more than just agent output), "display entry" (internal UI type)

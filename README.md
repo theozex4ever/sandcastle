@@ -792,7 +792,7 @@ Every event carries an envelope — `v` (schema version), `ts`, `sessionId`, `ru
 
 | Type                                               | When                                                                                                          |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `runStarted`                                       | Run begins. Carries `name`, `labels`, `agent`, `model`, `sandbox`, `branchStrategy`, `branch`.                |
+| `runStarted`                                       | Run begins. Carries `name`, `labels`, `agent`, `model`, `sandbox`, `branchStrategy`, `branch`, `pid`.         |
 | `iterationStarted` / `iterationFinished`           | Each iteration. `iterationFinished` carries `agentSessionId`, `usage` (when the agent reports it), `commits`. |
 | `worktreeReady`                                    | Worktree created (`reused: true` when a `createWorktree`/`createSandbox` handle is reused).                   |
 | `copyToWorktreeStarted` / `copyToWorktreeFinished` | `copyToWorktree` paths copied.                                                                                |
@@ -807,6 +807,8 @@ Every event carries an envelope — `v` (schema version), `ts`, `sessionId`, `ru
 | `runFinished` / `runFailed`                        | Outcome. `runFailed` carries `errorTag` (e.g. `AgentIdleTimeoutError`), `message`, `aborted`.                 |
 
 `runStarted` is emitted once setup validation has passed; configuration errors thrown synchronously by `run()` (missing prompt file, invalid options) do not produce events. `interactive()` sessions are not instrumented.
+
+To watch a session live, run [`sandcastle dashboard`](#sandcastle-dashboard) in the same repo. It shows each `phase` label as a station on a factory floor, every run's current state, a timeline of parallel runs, and each run's log. `pid` on `runStarted` lets it mark runs whose script exited without finishing them.
 
 ### Templates
 
@@ -856,6 +858,23 @@ Creates the following files:
 ```
 
 Errors if `.sandcastle/` already exists to prevent overwriting customizations.
+
+### `sandcastle dashboard`
+
+Starts a local web dashboard for [run events](#run-events). Run it from your repo root while (or after) a script runs, then open the printed URL. It lists every run session in `.sandcastle/events/`, tails the selected one live, and shows:
+
+- **Factory floor**: one station per `phase` label, with a tile per run showing its state (provisioning, setup, working, quiet, finishing, done, failed, lost), what the agent is doing right now, iterations, commits and tokens.
+- **Timeline**: every run on a shared time axis, so parallel implementers and the hand-off to reviewers and the merger are visible at a glance.
+- **Run inspector**: the run's live log (agent text, tool calls, hooks, commits), setup steps with durations, per-iteration token usage, and structured output or error.
+
+Runs without a `phase` label are grouped under one station. A run whose script process has exited without a `runFinished` or `runFailed` event is shown as lost.
+
+| Option   | Required | Default              | Description                                             |
+| -------- | -------- | -------------------- | ------------------------------------------------------- |
+| `--port` | No       | `4477`               | Port to listen on                                       |
+| `--host` | No       | `127.0.0.1`          | Interface to bind. The dashboard has no authentication. |
+| `--dir`  | No       | `.sandcastle/events` | Directory of run event files to watch                   |
+| `--demo` | No       | `false`              | Also serve a looping synthetic session to try the UI    |
 
 ### `sandcastle docker build-image`
 

@@ -59,6 +59,12 @@ export type RunEventPayload =
       readonly branch?: string;
       readonly maxIterations: number;
       readonly hostRepoDir: string;
+      /**
+       * Process id of the script that made the run, stamped by the emitter.
+       * Lets observers tell a crashed script from a live one. Absent in event
+       * files written before it was added.
+       */
+      readonly pid?: number;
     }
   | {
       readonly type: "worktreeReady";
@@ -306,6 +312,7 @@ export const createRunEventEmitter = (args: {
     // Envelope fields are spread last so a payload can never shadow them.
     const event = {
       ...payload,
+      ...(payload.type === "runStarted" ? { pid: process.pid } : {}),
       v: RUN_EVENT_SCHEMA_VERSION,
       ts: new Date().toISOString(),
       sessionId,
