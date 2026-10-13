@@ -1,5 +1,6 @@
 import { exec } from "node:child_process";
 import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -45,6 +46,32 @@ describe("sandcastle CLI", () => {
     expect(stdout).not.toContain("cleanup-sandbox");
     expect(stdout).not.toContain("sync-in");
     expect(stdout).not.toContain("sync-out");
+  });
+
+  it("dashboard --help shows its options", async () => {
+    const { stdout } = await runCli("dashboard --help", process.cwd());
+    expect(stdout).toContain("--port");
+    expect(stdout).toContain("--host");
+    expect(stdout).toContain("--dir");
+    expect(stdout).toContain("--demo");
+  });
+
+  it("dashboard fails clearly when the port is taken, without needing .sandcastle/", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-dash-"));
+    const blocker = createServer();
+    await new Promise<void>((r) => blocker.listen(0, "127.0.0.1", r));
+    const { port } = blocker.address() as AddressInfo;
+    try {
+      await runCli(`dashboard --port ${port}`, hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("already in use");
+      expect(output).not.toContain("No .sandcastle/ found");
+    } finally {
+      await new Promise((r) => blocker.close(r));
+    }
   });
 
   it("docker --help shows build-image and remove-image subcommands", async () => {

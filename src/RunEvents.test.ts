@@ -287,6 +287,7 @@ describe("run() emits run events", () => {
       branchStrategy: "head",
       branch: "main",
       maxIterations: 3,
+      pid: process.pid,
     });
     // Every event belongs to the same run.
     expect(new Set(seen.map((e) => e.runId)).size).toBe(1);

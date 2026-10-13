@@ -3,9 +3,17 @@ import { FileSystem } from "@effect/platform";
 import { Effect, Option } from "effect";
 import * as clack from "@clack/prompts";
 import { execSync } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { styleText } from "node:util";
 
+import {
+  DEFAULT_DASHBOARD_PORT,
+  DEMO_SESSION_ID,
+} from "./dashboard/protocol.js";
+import {
+  resolveDashboardAssetsDir,
+  startDashboardServer,
+} from "./dashboard/server.js";
 import { Display } from "./Display.js";
 import { buildImage, removeImage } from "./DockerLifecycle.js";
 import {
@@ -679,6 +687,89 @@ const podmanCommand = Command.make("podman", {}, () =>
   Command.withSubcommands([podmanBuildImageCommand, podmanRemoveImageCommand]),
 );
 
+// --- Dashboard command ---
+
+const dashboardPortOption = Options.integer("port").pipe(
+  Options.withDescription("Port to serve the dashboard on"),
+  Options.withDefault(DEFAULT_DASHBOARD_PORT),
+);
+
+const dashboardHostOption = Options.text("host").pipe(
+  Options.withDescription(
+    "Interface to bind. Defaults to localhost only; use 0.0.0.0 to expose it on your network",
+  ),
+  Options.withDefault("127.0.0.1"),
+);
+
+const dashboardDirOption = Options.text("dir").pipe(
+  Options.withDescription(
+    "Directory of run event files (default: .sandcastle/events in the current directory)",
+  ),
+  Options.optional,
+);
+
+const dashboardDemoOption = Options.boolean("demo").pipe(
+  Options.withDescription(
+    "Also serve a synthetic session replaying the parallel-planner-with-review template",
+  ),
+);
+
+const dashboardCommand = Command.make(
+  "dashboard",
+  {
+    port: dashboardPortOption,
+    host: dashboardHostOption,
+    dir: dashboardDirOption,
+    demo: dashboardDemoOption,
+  },
+  ({ port, host, dir, demo }) =>
+    Effect.gen(function* () {
+      const d = yield* Display;
+      const eventsDir =
+        dir._tag === "Some"
+          ? resolve(dir.value)
+          : join(process.cwd(), CONFIG_DIR, "events");
+
+      // Released when the fiber is interrupted (SIGINT / SIGTERM via runMain).
+      const server = yield* Effect.acquireRelease(
+        Effect.tryPromise(() =>
+          startDashboardServer({
+            eventsDir,
+            port,
+            host,
+            demo,
+            assetsDir: resolveDashboardAssetsDir(import.meta.url),
+          }),
+        ),
+        (s) => Effect.promise(() => s.close()),
+      ).pipe(
+        Effect.catchAll((error) =>
+          Effect.gen(function* () {
+            const cause = error.error;
+            yield* d.status(
+              cause instanceof Error ? cause.message : String(cause),
+              "error",
+            );
+            return yield* Effect.sync(() => process.exit(1) as never);
+          }),
+        ),
+      );
+
+      yield* d.status(`Dashboard running at ${server.url}`, "success");
+      yield* d.text(styleText("dim", `Watching ${eventsDir}`));
+      if (demo) {
+        yield* d.text(
+          styleText(
+            "dim",
+            `Serving the synthetic "${DEMO_SESSION_ID}" session`,
+          ),
+        );
+      }
+      yield* d.text(styleText("dim", "Press Ctrl+C to stop."));
+      return yield* Effect.never;
+    }).pipe(Effect.scoped),
+);
+
 // --- Root command ---
 
 const rootCommand = Command.make("sandcastle", {}, () =>
@@ -690,7 +781,12 @@ const rootCommand = Command.make("sandcastle", {}, () =>
 );
 
 export const sandcastle = rootCommand.pipe(
-  Command.withSubcommands([initCommand, dockerCommand, podmanCommand]),
+  Command.withSubcommands([
+    initCommand,
+    dockerCommand,
+    podmanCommand,
+    dashboardCommand,
+  ]),
 );
 
 export const cli = Command.run(sandcastle, {
